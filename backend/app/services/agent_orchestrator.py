@@ -133,7 +133,7 @@ class ClassificationAgent:
             print(f"[CLASSIFY] No prompt template found, using heuristic")
             return self._heuristic_classify(text, filename)
 
-        prompt = prompt_template.replace("{text}", text[:8000]).replace("{filename}", filename)
+        prompt = prompt_template.replace("{text}", text[:64000]).replace("{filename}", filename)
         try:
             t0 = __import__("time").time()
             result = groq_service._parse_json(
@@ -187,7 +187,7 @@ class CategoryExtractionAgent:
             print(f"[EXTRACT] No prompt found for agent '{agent}', returning empty")
             return {"extracted_data": {}, "confidence": 0.0}
 
-        prompt = prompt_template.replace("{text}", text[:8000] if text else "")
+        prompt = prompt_template.replace("{text}", text[:64000] if text else "")
         print(f"[EXTRACT] Prompt loaded ({len(prompt_template)} chars), sending to LLM...")
 
         try:

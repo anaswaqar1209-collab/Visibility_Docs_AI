@@ -23,7 +23,6 @@ def _get_supabase():
         try:
             from supabase import create_client
             _supabase_client = create_client(url, key)
-            _supabase_client.table("documents").select("id").limit(1).execute()
             _use_supabase = True
         except Exception:
             _supabase_client = None
@@ -240,18 +239,22 @@ class SupabaseDB:
 
     @staticmethod
     def delete_document_cascade(document_id: str):
+        cascade_tables = ["document_chunks", "document_embeddings", "document_extractions",
+                          "documents_metadata", "processing_jobs", "agent_runs",
+                          "workflow_instances"]
         try:
             client = _get_supabase()
             if _use_supabase and client:
-                client.rpc("delete_document_cascade", {"p_document_id": document_id}).execute()
+                for tbl in cascade_tables:
+                    client.table(tbl).delete().eq("document_id", document_id).execute()
+                client.table("validation_results").delete().eq("source_document_id", document_id).execute()
+                client.table("documents").delete().eq("id", document_id).execute()
         except Exception:
             pass
         conn = _get_local_db()
         conn.execute("BEGIN")
         try:
-            for tbl in ("document_chunks", "document_embeddings", "document_extractions",
-                        "documents_metadata", "processing_jobs", "agent_runs",
-                        "workflow_instances"):
+            for tbl in cascade_tables:
                 conn.execute(f"DELETE FROM {tbl} WHERE document_id=?", (document_id,))
             conn.execute("DELETE FROM validation_results WHERE source_document_id=?", (document_id,))
             conn.execute("DELETE FROM documents WHERE id=?", (document_id,))

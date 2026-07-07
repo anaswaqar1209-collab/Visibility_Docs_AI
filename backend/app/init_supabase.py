@@ -216,8 +216,9 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS document_ids JSONB DEFAULT '[]'::jsonb;
+
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_org ON chat_sessions(organization_id);
-CREATE INDEX IF NOT EXISTS idx_chat_sessions_doc ON chat_sessions(document_id);
 
 CREATE TABLE IF NOT EXISTS chat_messages (
     id SERIAL PRIMARY KEY,
@@ -241,6 +242,10 @@ def init_supabase_schema(database_url: str) -> bool:
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute(SCHEMA_SQL)
+        try:
+            cur.execute("NOTIFY pgrst, 'reload schema'")
+        except Exception:
+            pass
         cur.close()
         conn.close()
         logger.info("Supabase schema initialized successfully")

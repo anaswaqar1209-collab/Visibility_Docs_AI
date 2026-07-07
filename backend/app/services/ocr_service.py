@@ -94,8 +94,12 @@ class OCRService:
 
         texts = []
         for img_path in image_paths:
-            b64 = self._image_to_base64(img_path)
             ext = os.path.splitext(img_path)[1].lower().lstrip(".")
+            if ext not in ("jpg", "jpeg", "png", "tiff", "tif", "bmp"):
+                texts.append("")
+                continue
+
+            b64 = self._image_to_base64(img_path)
             mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
 
             messages = [
@@ -114,48 +118,114 @@ class OCRService:
                 if ("does not support image" in result.lower() or
                     "cannot read" in result.lower() or
                     "not configured" in result.lower()):
-                    return ""
+                    texts.append("")
+                    continue
 
                 if result and not result.startswith("[Groq"):
                     texts.append(result)
                 else:
-                    return ""
+                    texts.append("")
+                    continue
             except Exception:
-                return ""
+                texts.append("")
+                continue
 
         return "\n\n--- Page Break ---\n\n".join(texts)
+
+    def _detect_regions(self, ocr_result: list) -> list[dict]:
+        regions = []
+        if not ocr_result or not ocr_result[0]:
+            return regions
+        for line in ocr_result[0]:
+            box = line[0]
+            text = line[1][0] if len(line) > 1 and line[1] else ""
+            conf = line[1][1] if len(line) > 1 and line[1] else 0
+            x0 = min(p[0] for p in box)
+            y0 = min(p[1] for p in box)
+            x1 = max(p[0] for p in box)
+            y1 = max(p[1] for p in box)
+            regions.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "text": text.strip(), "conf": conf})
+        return regions
+
+    def _group_regions(self, regions: list[dict], y_gap: int = 15) -> list[list[dict]]:
+        if not regions:
+            return []
+        sorted_reg = sorted(regions, key=lambda r: (r["y0"], r["x0"]))
+        groups = [[sorted_reg[0]]]
+        for r in sorted_reg[1:]:
+            last = groups[-1][-1]
+            if abs(r["y0"] - last["y1"]) <= y_gap and abs(r["x0"] - last["x0"]) <= 50:
+                groups[-1].append(r)
+            else:
+                groups.append([r])
+        return groups
 
     def _paddle_ocr(self, image_paths: list[str]) -> str:
         texts = []
         errors = []
-        # Use a fresh PaddleOCR instance each time to avoid state corruption
-        ocr = self._fresh_paddle()
+        ocr = self._get_paddle()
         if ocr is None:
-            return ""
+            # Fall back to fresh instance if singleton corrupted
+            ocr = self._fresh_paddle()
+            if ocr is None:
+                return ""
 
         for img_path in image_paths:
             try:
                 result = ocr.ocr(img_path, cls=True)
                 if result and result[0]:
+                    regions = self._detect_regions(result)
+                    groups = self._group_regions(regions)
                     page_text = []
-                    for line in result[0]:
-                        text = line[1][0] if len(line) > 1 and line[1] else ""
-                        if text.strip():
-                            page_text.append(text.strip())
+                    for group in groups:
+                        line_text = " ".join(r["text"] for r in group if r["text"])
+                        if line_text:
+                            page_text.append(line_text)
                     texts.append("\n".join(page_text))
                 else:
                     texts.append("")
             except Exception as e:
                 err = str(e)
+                if "state corruption" in err.lower() or "cudnn" in err.lower():
+                    logger.warning(f"PaddleOCR state corruption on {img_path}, creating fresh instance")
+                    ocr = self._fresh_paddle()
+                    if ocr:
+                        try:
+                            result = ocr.ocr(img_path, cls=True)
+                            if result and result[0]:
+                                regions = self._detect_regions(result)
+                                groups = self._group_regions(regions)
+                                page_text = []
+                                for group in groups:
+                                    line_text = " ".join(r["text"] for r in group if r["text"])
+                                    if line_text:
+                                        page_text.append(line_text)
+                                texts.append("\n".join(page_text))
+                                continue
+                        except Exception:
+                            pass
                 logger.error(f"PaddleOCR error on {img_path}: {err}")
                 errors.append(err)
                 texts.append("")
 
         if errors:
-            # Log summary but continue with whatever text we got
             logger.warning(f"PaddleOCR had {len(errors)}/{len(image_paths)} page errors")
 
-        return "\n\n--- Page Break ---\n\n".join(texts)
+        result = "\n\n--- Page Break ---\n\n".join(texts)
+        # If all failed, fall back to direct text
+        if not result.strip():
+            try:
+                import fitz
+                doc = fitz.open(image_paths[0].rsplit("_", 1)[0] + ".pdf" if "_" in image_paths[0] else image_paths[0])
+                direct = ""
+                for page in doc:
+                    direct += page.get_text()
+                doc.close()
+                if direct.strip():
+                    return direct
+            except Exception:
+                pass
+        return result
 
     def _tesseract_ocr(self, image_paths: list[str]) -> str:
         import pytesseract

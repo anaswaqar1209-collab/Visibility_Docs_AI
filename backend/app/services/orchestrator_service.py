@@ -275,6 +275,17 @@ class OrchestratorService:
             self.update_stage(document_id, organization_id, "extracting", 70, "running")
             print(f"[PIPELINE] Stage 3/4: Extraction + Embedding (parallel)")
 
+            # Extract tables and prepend to raw_text for extraction
+            try:
+                from .table_service import extract_tables, tables_to_text
+                detected_tables = extract_tables(file_path)
+                if detected_tables:
+                    table_text = tables_to_text(detected_tables)
+                    raw_text = table_text + "\n\n" + raw_text
+                    print(f"[PIPELINE] Prepended {len(detected_tables)} tables ({len(table_text)} chars) to raw_text")
+            except Exception as e:
+                print(f"[PIPELINE] Table extraction skipped: {e}")
+
             if doc_type == "other":
                 # Skip Groq extraction for 'other' type — no structured fields expected
                 extraction = {"extracted_data": {}, "confidence": 0.0}
