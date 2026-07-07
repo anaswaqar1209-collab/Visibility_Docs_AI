@@ -129,8 +129,8 @@ class RAGService:
             pass
         return titles
 
-    def hybrid_search(self, query: str, organization_id: str, document_type: str = None, limit: int = 10, offset: int = 0) -> list[dict]:
-        print(f"\n[SEARCH] Query: '{query}' | org={organization_id} | type={document_type or 'all'} | limit={limit}")
+    def hybrid_search(self, query: str, organization_id: str, document_type: str = None, document_ids: list = None, limit: int = 10, offset: int = 0) -> list[dict]:
+        print(f"\n[SEARCH] Query: '{query}' | org={organization_id} | type={document_type or 'all'} | docs={document_ids or 'all'} | limit={limit}")
         query_embedding = embedding_service.embed_query(query)
         results = []
         seen_ids = set()
@@ -140,8 +140,10 @@ class RAGService:
             filter_dict = {"organization_id": organization_id}
             if document_type:
                 filter_dict["document_type"] = document_type
+            if document_ids:
+                filter_dict["document_id"] = {"$in": document_ids}
             print(f"[SEARCH] Querying Pinecone (ns='{organization_id}')...")
-            pinecone_results = pinecone_service.query(query_embedding, top_k=limit + 5, filter=filter_dict if document_type else None, namespace=organization_id)
+            pinecone_results = pinecone_service.query(query_embedding, top_k=limit + 5, filter=filter_dict if len(filter_dict) > 1 else None, namespace=organization_id)
             if pinecone_results:
                 print(f"[SEARCH] Pinecone returned {len(pinecone_results)} results")
                 doc_ids = list(set(r["metadata"].get("document_id", "") for r in pinecone_results))
@@ -273,6 +275,9 @@ class RAGService:
                     })
 
         results = sorted(results, key=lambda x: x["score"], reverse=True)
+        if document_ids:
+            doc_set = set(document_ids)
+            results = [r for r in results if r["document_id"] in doc_set]
         return results[offset:offset + limit]
 
     def get_document_context(self, document_id: str, organization_id: str, max_chunks: int = 10) -> str:

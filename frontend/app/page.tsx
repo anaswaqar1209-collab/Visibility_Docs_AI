@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 
 async function safeJson(res: Response) {
   try {
@@ -528,12 +528,69 @@ function ChatSection({ onMsg }: { onMsg: (m: string, t?: "info"|"error"|"success
   const [messages, setMessages] = useState<{role:string;content:string}[]>([]);
   const [loading, setLoading] = useState(false);
   const [docQuery, setDocQuery] = useState("");
-  const [selectedDoc, setSelectedDoc] = useState<any>(null);
+  const [selectedDocs, setSelectedDocs] = useState<any[]>([]);
   const [docs, setDocs] = useState<any[]>([]);
   const [searching, setSearching] = useState(false);
   const [sources, setSources] = useState<any[]>([]);
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string|null>(null);
+  const [showSessions, setShowSessions] = useState(true);
   const chatEnd = useRef<HTMLDivElement>(null);
   const timerRef = useRef<any>(null);
+
+  const loadSessions = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/v1/chat/sessions?organization_id=${ORG}`);
+      const d = await safeJson(r as any);
+      if ((r as any).ok) setSessions(d.sessions || []);
+    } catch {}
+  }, []);
+
+  useEffect(() => { loadSessions(); }, [loadSessions]);
+
+  const startNewChat = () => {
+    setActiveSessionId(null);
+    setMessages([]);
+    setSources([]);
+    setSelectedDocs([]);
+    setDocQuery("");
+  };
+
+  const loadSession = async (sid: string) => {
+    try {
+      const r = await fetch(`${API}/api/v1/chat/sessions/${sid}`);
+      const d = await safeJson(r as any);
+      if ((r as any).ok && d) {
+        setActiveSessionId(d.id);
+        setMessages((d.messages || []).map((m: any) => ({role: m.role, content: m.content})));
+        setSources([]);
+        const docIds = d.document_ids || [];
+        if (docIds.length > 0) {
+          const fr = await fetch(`${API}/api/v1/documents?organization_id=${ORG}&limit=100`);
+          const fd = await safeJson(fr as any);
+          if ((fr as any).ok) {
+            const allDocs: any[] = fd.documents || [];
+            setSelectedDocs(allDocs.filter((dd: any) => docIds.includes(dd.id)));
+          }
+        } else {
+          setSelectedDocs([]);
+        }
+      }
+    } catch {}
+  };
+
+  const deleteSession = async (sid: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await fetch(`${API}/api/v1/chat/sessions/${sid}`, { method: "DELETE" });
+      if (activeSessionId === sid) startNewChat();
+      loadSessions();
+    } catch {}
+  };
+
+  const removeDoc = (docId: string) => {
+    setSelectedDocs(prev => prev.filter(d => d.id !== docId));
+  };
 
   const searchDocs = async (q: string) => {
     if (!q.trim()) { setDocs([]); return; }
@@ -546,6 +603,14 @@ function ChatSection({ onMsg }: { onMsg: (m: string, t?: "info"|"error"|"success
     finally { setSearching(false); }
   };
 
+  const addDoc = (doc: any) => {
+    if (!selectedDocs.find(d => d.id === doc.id)) {
+      setSelectedDocs(prev => [...prev, doc]);
+    }
+    setDocQuery("");
+    setDocs([]);
+  };
+
   const ask = async () => {
     if (!question.trim()) return;
     setLoading(true);
@@ -553,16 +618,17 @@ function ChatSection({ onMsg }: { onMsg: (m: string, t?: "info"|"error"|"success
     setQuestion("");
     setMessages(prev => [...prev, {role:"user", content:userMsg}]);
     try {
-      const docId = selectedDoc?.id || "";
-      const sessionId = selectedDoc ? `doc_${docId}` : "all_docs";
-      const body = { question: userMsg, organization_id: ORG, document_id: docId || "all", session_id: sessionId };
-      const endpoint = docId ? `${API}/api/v1/chat` : `${API}/api/v1/chat/all`;
-      const r = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const docIds = selectedDocs.map(d => d.id);
+      const sid = activeSessionId || undefined;
+      const body: any = { question: userMsg, organization_id: ORG, document_ids: docIds, session_id: sid };
+      const r = await fetch(`${API}/api/v1/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const d = await safeJson(r as any);
       if ((r as any).ok) {
+        if (d.session_id) setActiveSessionId(d.session_id);
         setMessages(prev => [...prev, {role:"assistant", content:d.answer || "No answer"}]);
         if (d.history && d.history.length > 0) setMessages(d.history);
         setSources(d.sources || []);
+        loadSessions();
       } else {
         setMessages(prev => [...prev, {role:"assistant", content:`Error: ${d.detail}`}]);
       }
@@ -573,94 +639,144 @@ function ChatSection({ onMsg }: { onMsg: (m: string, t?: "info"|"error"|"success
   };
 
   return (
-    <div className="flex-1 flex flex-col bg-white">
-      <div className="border-b border-gray-200 px-6 py-3 flex items-center gap-3 shrink-0">
-        <div className="relative flex-1 max-w-md">
-          <input value={docQuery} onChange={e => { const v=e.target.value; setDocQuery(v); setSelectedDoc(null); setMessages([]); setSources([]); if (timerRef.current) clearTimeout(timerRef.current); timerRef.current = setTimeout(() => searchDocs(v), 300); }}
-            placeholder={selectedDoc ? selectedDoc.title : "Search & select a document (blank = all docs)..."}
-            className="w-full px-3 py-2 text-xs border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-200 bg-gray-50" />
-          {searching && <span className="absolute right-2.5 top-2 text-xs text-gray-400">...</span>}
-          {docs.length > 0 && (
-            <div className="absolute z-20 w-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
-              {docs.map((d, i) => (
-                <div key={i} onClick={() => { setSelectedDoc(d); setDocQuery(d.title); setDocs([]); setMessages([]); setSources([]); }}
-                     className="px-3 py-2.5 hover:bg-blue-50 cursor-pointer border-b border-gray-100 last:border-0 text-xs">
-                  <span className="font-medium text-blue-700">{d.title}</span>
-                  <span className="text-gray-400 ml-2">{d.document_type}</span>
+    <div className="flex-1 flex bg-white">
+      {showSessions && (
+        <div className="w-60 border-r border-gray-200 flex flex-col bg-gray-50 shrink-0">
+          <div className="p-3 border-b border-gray-200 flex items-center justify-between">
+            <span className="text-xs font-semibold text-gray-600 uppercase tracking-wider">History</span>
+            <button onClick={startNewChat}
+              className="text-xs px-2.5 py-1 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">+ New</button>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            {sessions.length === 0 ? (
+              <div className="p-4 text-xs text-gray-400 text-center">No chat history yet</div>
+            ) : (
+              sessions.map(s => (
+                <div key={s.id} onClick={() => loadSession(s.id)}
+                  className={`px-3 py-2.5 border-b border-gray-100 cursor-pointer hover:bg-blue-50 transition text-xs group ${
+                    activeSessionId === s.id ? "bg-blue-50 border-l-2 border-l-blue-600" : ""
+                  }`}>
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium text-gray-800 truncate">{s.title}</p>
+                      <p className="text-gray-400 mt-0.5">{s.document_ids?.length ? `${s.document_ids.length} doc(s)` : "All Documents"}</p>
+                    </div>
+                    <button onClick={(e) => deleteSession(s.id, e)}
+                      className="text-gray-300 hover:text-red-500 ml-1 shrink-0">&times;</button>
+                  </div>
+                  <p className="text-gray-300 mt-1">
+                    {s.updated_at ? new Date(s.updated_at).toLocaleDateString() : ""}
+                  </p>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+      <div className="flex-1 flex flex-col">
+        <div className="border-b border-gray-200 px-6 py-3 flex items-center gap-3 shrink-0">
+          <button onClick={() => setShowSessions(!showSessions)} title="Toggle history sidebar"
+            className="text-gray-400 hover:text-gray-600 text-lg leading-none mr-1">
+            {showSessions ? "◀" : "☰"}
+          </button>
+          <div className="relative flex-1 max-w-md">
+            <input value={docQuery} onChange={e => { const v=e.target.value; setDocQuery(v); if (timerRef.current) clearTimeout(timerRef.current); timerRef.current = setTimeout(() => searchDocs(v), 300); }}
+              placeholder="Search & select documents..."
+              className="w-full px-3 py-2 text-xs border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-200 bg-gray-50" />
+            {searching && <span className="absolute right-2.5 top-2 text-xs text-gray-400">...</span>}
+            {docs.length > 0 && (
+              <div className="absolute z-20 w-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+                {docs.filter(d => !selectedDocs.find(sd => sd.id === d.id)).map((d, i) => (
+                  <div key={i} onClick={() => addDoc(d)}
+                       className="px-3 py-2.5 hover:bg-blue-50 cursor-pointer border-b border-gray-100 last:border-0 text-xs">
+                    <span className="font-medium text-blue-700">{d.title}</span>
+                    <span className="text-gray-400 ml-2">{d.document_type}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {selectedDocs.length > 0 && (
+          <div className="px-6 py-2 border-b border-gray-100 flex flex-wrap gap-1.5 items-center bg-gray-50">
+            <span className="text-[10px] text-gray-400 font-medium mr-1">Documents:</span>
+            {selectedDocs.map(d => (
+              <span key={d.id} className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-[11px] font-medium">
+                {d.title}
+                <button onClick={() => removeDoc(d.id)} className="text-blue-400 hover:text-red-500 leading-none">&times;</button>
+              </span>
+            ))}
+            <button onClick={() => setSelectedDocs([])} className="text-[10px] text-gray-400 hover:text-red-500 ml-1">Clear</button>
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto px-6 py-4" style={{maxHeight: "calc(100vh - 200px)"}}>
+          {messages.length === 0 ? (
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center">
+                <div className="text-4xl mb-3 text-gray-300">💬</div>
+                <p className="text-sm text-gray-400 font-medium">
+                  {selectedDocs.length > 0
+                    ? `Ask about ${selectedDocs.length} document(s)`
+                    : "Search & select documents to ask questions"}
+                </p>
+                <p className="text-xs text-gray-300 mt-1">Type a question below to start</p>
+              </div>
+            </div>
+          ) : (
+            <div className="max-w-3xl mx-auto space-y-4">
+              {messages.map((m, i) => (
+                <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div className={`max-w-[75%] px-4 py-3 rounded-xl text-sm leading-relaxed ${
+                    m.role === "user"
+                      ? "bg-blue-600 text-white rounded-br-sm"
+                      : "bg-gray-50 border border-gray-100 text-gray-800 rounded-bl-sm"
+                  }`}>
+                    <div className="whitespace-pre-wrap">{m.content}</div>
+                  </div>
                 </div>
               ))}
+              {loading && (
+                <div className="flex justify-start">
+                  <div className="bg-gray-50 border border-gray-100 rounded-xl rounded-bl-sm px-4 py-3 text-sm text-gray-400 flex items-center gap-1.5">
+                    <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" style={{animation:"bounce 1.4s infinite",animationDelay:"0ms"}} />
+                    <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" style={{animation:"bounce 1.4s infinite",animationDelay:"200ms"}} />
+                    <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" style={{animation:"bounce 1.4s infinite",animationDelay:"400ms"}} />
+                  </div>
+                </div>
+              )}
+              <div ref={chatEnd} />
             </div>
           )}
         </div>
-        {selectedDoc && (
-          <div className="flex items-center gap-2 text-xs">
-            <span className="text-blue-600 font-medium truncate max-w-[120px]">{selectedDoc.title}</span>
-            <button onClick={() => { setSelectedDoc(null); setDocQuery(""); setMessages([]); setSources([]); }}
-              className="text-gray-400 hover:text-red-500">&times;</button>
+
+        {sources.length > 0 && (
+          <div className="px-6 py-2 border-t border-gray-100 bg-gray-50">
+            <details className="text-xs text-gray-500">
+              <summary className="cursor-pointer font-medium">Sources ({sources.length})</summary>
+              <div className="mt-1 space-y-0.5">
+                {sources.slice(0, 3).map((s, i) => (
+                  <p key={i} className="text-blue-600">
+                    {s.document_title || s.document_id?.substring(0, 12)} ({s.score ? `${(s.score * 100).toFixed(0)}%` : "direct"})
+                  </p>
+                ))}
+              </div>
+            </details>
           </div>
         )}
-      </div>
 
-      <div className="flex-1 overflow-y-auto px-6 py-4" style={{maxHeight: "calc(100vh - 160px)"}}>
-        {messages.length === 0 ? (
-          <div className="flex items-center justify-center h-full">
-            <div className="text-center">
-              <div className="text-4xl mb-3 text-gray-300">💬</div>
-              <p className="text-sm text-gray-400 font-medium">{selectedDoc ? `Ask about "${selectedDoc.title}"` : "Select a document or ask across all documents"}</p>
-              <p className="text-xs text-gray-300 mt-1">Type a question below to start</p>
-            </div>
+        <div className="border-t border-gray-200 px-6 py-3 shrink-0">
+          <div className="flex gap-2 max-w-3xl mx-auto">
+            <input value={question} onChange={e => setQuestion(e.target.value)}
+              placeholder={selectedDocs.length > 0 ? "Ask a question about selected documents..." : "Search & select documents first..."}
+              className="flex-1 px-4 py-2.5 text-sm border border-gray-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-300 bg-gray-50"
+              onKeyDown={e => e.key === "Enter" && ask()} />
+            <button onClick={ask} disabled={loading || !question.trim()}
+              className="px-5 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center gap-1.5">
+              {loading ? "..." : <><span>Send</span><span className="text-base">→</span></>}
+            </button>
           </div>
-        ) : (
-          <div className="max-w-3xl mx-auto space-y-4">
-            {messages.map((m, i) => (
-              <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                <div className={`max-w-[75%] px-4 py-3 rounded-xl text-sm leading-relaxed ${
-                  m.role === "user"
-                    ? "bg-blue-600 text-white rounded-br-sm"
-                    : "bg-gray-50 border border-gray-100 text-gray-800 rounded-bl-sm"
-                }`}>
-                  <div className="whitespace-pre-wrap">{m.content}</div>
-                </div>
-              </div>
-            ))}
-            {loading && (
-              <div className="flex justify-start">
-                <div className="bg-gray-50 border border-gray-100 rounded-xl rounded-bl-sm px-4 py-3 text-sm text-gray-400 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" style={{animation:"bounce 1.4s infinite",animationDelay:"0ms"}} />
-                  <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" style={{animation:"bounce 1.4s infinite",animationDelay:"200ms"}} />
-                  <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" style={{animation:"bounce 1.4s infinite",animationDelay:"400ms"}} />
-                </div>
-              </div>
-            )}
-            <div ref={chatEnd} />
-          </div>
-        )}
-      </div>
-
-      {sources.length > 0 && (
-        <div className="px-6 py-2 border-t border-gray-100 bg-gray-50">
-          <details className="text-xs text-gray-500">
-            <summary className="cursor-pointer font-medium">Sources ({sources.length})</summary>
-            <div className="mt-1 space-y-0.5">
-              {sources.slice(0, 3).map((s, i) => (
-                <p key={i} className="text-blue-600">
-                  {s.document_title || s.document_id?.substring(0, 12)} ({s.score ? `${(s.score * 100).toFixed(0)}%` : "direct"})
-                </p>
-              ))}
-            </div>
-          </details>
-        </div>
-      )}
-
-      <div className="border-t border-gray-200 px-6 py-3 shrink-0">
-        <div className="flex gap-2 max-w-3xl mx-auto">
-          <input value={question} onChange={e => setQuestion(e.target.value)} placeholder="Ask a question about the selected document..."
-            className="flex-1 px-4 py-2.5 text-sm border border-gray-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-300 bg-gray-50"
-            onKeyDown={e => e.key === "Enter" && ask()} />
-          <button onClick={ask} disabled={loading || !question.trim()}
-            className="px-5 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center gap-1.5">
-            {loading ? "..." : <><span>Send</span><span className="text-base">→</span></>}
-          </button>
         </div>
       </div>
     </div>

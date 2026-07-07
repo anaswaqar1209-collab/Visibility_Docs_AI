@@ -1,42 +1,52 @@
 from .conversation_service import conversation_service
 from .rag_service import rag_service
+from ..database import SupabaseDB
 
 
 class ChatService:
-    def chat_with_document(self, question: str, document_id: str, organization_id: str,
-                           chat_history: list[dict] = None, session_id: str = None) -> dict:
-        sid = session_id or f"doc_{document_id}"
-        context = rag_service.get_document_context(document_id, organization_id)
+    def _get_or_create_session(self, session_id: str, organization_id: str, document_ids: list = None) -> tuple[str, list]:
+        if session_id:
+            existing = SupabaseDB.get_chat_session(session_id)
+            if existing:
+                stored_ids = existing.get("document_ids") or []
+                return session_id, stored_ids
+        doc_list = document_ids or []
+        new_id = SupabaseDB.create_chat_session(organization_id, "New Chat", doc_list)
+        return new_id, doc_list
 
-        if not context:
-            answer = "I cannot find this information in the document. The document may not have been processed yet."
-            conversation_service.chat(question, "", session_id=sid)
+    def _auto_title(self, session_id: str, first_question: str):
+        title = first_question[:80].strip()
+        if len(title) == 80:
+            title = title[:77] + "..."
+        SupabaseDB.update_chat_session_title(session_id, title)
+
+    def _save_exchange(self, session_id: str, question: str, answer: str, sources: list, is_first: bool):
+        SupabaseDB.save_chat_message(session_id, "user", question)
+        SupabaseDB.save_chat_message(session_id, "assistant", answer, sources)
+        if is_first:
+            self._auto_title(session_id, question)
+
+    def chat_with_document(self, question: str, document_ids: list, organization_id: str,
+                           chat_history: list[dict] = None, session_id: str = None) -> dict:
+        sid, resolved_ids = self._get_or_create_session(session_id, organization_id, document_ids)
+        existing = SupabaseDB.get_chat_session(sid)
+        is_first = not bool(existing.get("messages")) if existing else True
+
+        if resolved_ids:
+            search_results = rag_service.hybrid_search(question, organization_id, document_ids=resolved_ids, limit=5)
         else:
-            answer = conversation_service.chat(question, context, session_id=sid)
-
-        history = conversation_service.get_history(sid)
-        sources = [{"document_id": document_id, "relevance": "direct"}]
-
-        return {
-            "answer": answer,
-            "sources": sources,
-            "document_id": document_id,
-            "history": history,
-        }
-
-    def chat_all_documents(self, question: str, organization_id: str,
-                           chat_history: list[dict] = None, session_id: str = None) -> dict:
-        sid = session_id or "all_docs"
-        search_results = rag_service.hybrid_search(question, organization_id, limit=5)
+            search_results = rag_service.hybrid_search(question, organization_id, limit=5)
 
         if not search_results:
-            answer = "I could not find any relevant information in your documents."
+            answer = "I could not find any relevant information in the selected documents."
             conversation_service.chat(question, "", session_id=sid)
+            self._save_exchange(sid, question, answer, [], is_first)
             return {
                 "answer": answer,
                 "sources": [],
-                "document_id": "",
+                "document_id": resolved_ids[0] if resolved_ids else "",
                 "history": conversation_service.get_history(sid),
+                "session_id": sid,
             }
 
         context_parts = []
@@ -54,12 +64,14 @@ class ChatService:
 
         answer = conversation_service.chat(question, context, session_id=sid)
         history = conversation_service.get_history(sid)
+        self._save_exchange(sid, question, answer, sources[:5], is_first)
 
         return {
             "answer": answer,
             "sources": sources[:5],
             "document_id": sources[0]["document_id"] if sources else "",
             "history": history,
+            "session_id": sid,
         }
 
 

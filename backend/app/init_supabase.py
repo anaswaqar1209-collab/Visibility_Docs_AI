@@ -206,6 +206,29 @@ BEGIN
     DELETE FROM documents WHERE id = p_document_id;
 END;
 $$;
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL,
+    document_ids JSONB DEFAULT '[]'::jsonb,
+    title TEXT NOT NULL DEFAULT 'New Chat',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_org ON chat_sessions(organization_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_doc ON chat_sessions(document_id);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    sources JSONB,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
 """
 
 

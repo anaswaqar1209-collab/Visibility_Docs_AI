@@ -1,25 +1,61 @@
 from fastapi import APIRouter, HTTPException, Body, status
-from ..models.schemas import ChatRequest, ChatResponse
+from ..models.schemas import ChatRequest, ChatResponse, ChatSessionResponse, ChatSessionListResponse
 from ..services.chat_service import chat_service
+from ..database import SupabaseDB
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
+
+
+@router.get(
+    "/sessions",
+    response_model=ChatSessionListResponse,
+    summary="List chat sessions",
+    description="List all chat sessions for an organization",
+)
+async def list_sessions(organization_id: str):
+    sessions = SupabaseDB.list_chat_sessions(organization_id)
+    return {"sessions": sessions, "total": len(sessions)}
+
+
+@router.get(
+    "/sessions/{session_id}",
+    response_model=ChatSessionResponse,
+    summary="Get chat session",
+    description="Get a chat session with all its messages",
+)
+async def get_session(session_id: str):
+    session = SupabaseDB.get_chat_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete chat session",
+    description="Delete a chat session and all its messages",
+)
+async def delete_session(session_id: str):
+    SupabaseDB.delete_chat_session(session_id)
+    return {"message": "Session deleted"}
 
 
 @router.post(
     "",
     response_model=ChatResponse,
-    summary="Chat with a specific document",
-    description="Ask questions about a specific document using RAG + Groq AI",
+    summary="Chat with documents",
+    description="Ask questions about selected documents using RAG + Groq AI",
 )
 async def chat_with_document(request: ChatRequest = Body(...)):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
-    if not request.document_id or request.document_id == "all":
-        raise HTTPException(status_code=400, detail="Provide a valid document_id for document-specific chat")
+
+    doc_ids = request.document_ids or ([request.document_id] if request.document_id else [])
 
     result = chat_service.chat_with_document(
         question=request.question,
-        document_id=request.document_id,
+        document_ids=doc_ids,
         organization_id=request.organization_id,
         chat_history=request.chat_history,
         session_id=request.session_id,
@@ -30,6 +66,7 @@ async def chat_with_document(request: ChatRequest = Body(...)):
         sources=result["sources"],
         document_id=result["document_id"],
         history=result.get("history", []),
+        session_id=result.get("session_id"),
     )
 
 
@@ -43,8 +80,9 @@ async def chat_all_documents(request: ChatRequest = Body(...)):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    result = chat_service.chat_all_documents(
+    result = chat_service.chat_with_document(
         question=request.question,
+        document_ids=[],
         organization_id=request.organization_id,
         chat_history=request.chat_history,
         session_id=request.session_id,
@@ -55,4 +93,5 @@ async def chat_all_documents(request: ChatRequest = Body(...)):
         sources=result["sources"],
         document_id=result["document_id"],
         history=result.get("history", []),
+        session_id=result.get("session_id"),
     )

@@ -166,6 +166,24 @@ def _init_local_db(conn):
         CREATE INDEX IF NOT EXISTS idx_emb_doc ON document_embeddings(document_id);
         CREATE INDEX IF NOT EXISTS idx_emb_chunk ON document_embeddings(chunk_id);
         CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(document_type);
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL,
+            document_ids TEXT DEFAULT '[]',
+            title TEXT NOT NULL DEFAULT 'New Chat',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_sessions_org ON chat_sessions(organization_id);
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            sources TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
     """)
     try:
         conn.executescript("""
@@ -307,6 +325,152 @@ class SupabaseDB:
         except Exception:
             pass
         return _local_search_vector(query_vector, match_threshold, match_count, filter_org_id)
+
+    @staticmethod
+    def create_chat_session(organization_id: str, title: str = "New Chat", document_ids: list = None) -> str:
+        import uuid
+        session_id = uuid.uuid4().hex
+        doc_list = document_ids or []
+        doc_ids_json = __import__("json").dumps(doc_list)
+        now = datetime.utcnow().isoformat()
+        try:
+            client = _get_supabase()
+            if _use_supabase and client:
+                client.table("chat_sessions").insert({
+                    "id": session_id, "organization_id": organization_id, "title": title,
+                    "document_ids": doc_list, "created_at": now, "updated_at": now,
+                }).execute()
+        except Exception:
+            pass
+        conn = _get_local_db()
+        conn.execute("INSERT INTO chat_sessions (id, organization_id, document_ids, title, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                     (session_id, organization_id, doc_ids_json, title, now, now))
+        conn.commit()
+        return session_id
+
+    @staticmethod
+    def list_chat_sessions(organization_id: str, document_id: str = None) -> list[dict]:
+        try:
+            client = _get_supabase()
+            if _use_supabase and client:
+                query = client.table("chat_sessions").select("*").eq("organization_id", organization_id).order("updated_at", desc=True)
+                result = query.execute()
+                if result.data:
+                    rows = result.data
+                    for r in rows:
+                        if isinstance(r.get("document_ids"), str):
+                            try:
+                                r["document_ids"] = __import__("json").loads(r["document_ids"])
+                            except Exception:
+                                r["document_ids"] = []
+                    return rows
+        except Exception:
+            pass
+        conn = _get_local_db()
+        rows = conn.execute("SELECT * FROM chat_sessions WHERE organization_id=? ORDER BY updated_at DESC", (organization_id,)).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d.get("document_ids"), str):
+                try:
+                    d["document_ids"] = __import__("json").loads(d["document_ids"])
+                except Exception:
+                    d["document_ids"] = []
+            result.append(d)
+        return result
+
+    @staticmethod
+    def get_chat_session(session_id: str) -> dict | None:
+        try:
+            client = _get_supabase()
+            if _use_supabase and client:
+                result = client.table("chat_sessions").select("*").eq("id", session_id).single().execute()
+                if getattr(result, "data", None):
+                    d = result.data
+                    if isinstance(d.get("document_ids"), str):
+                        try:
+                            d["document_ids"] = __import__("json").loads(d["document_ids"])
+                        except Exception:
+                            d["document_ids"] = []
+                    msgs = client.table("chat_messages").select("*").eq("session_id", session_id).order("created_at", asc=True).execute()
+                    msg_data = getattr(msgs, "data", [])
+                    for m in msg_data:
+                        if m.get("sources") and isinstance(m["sources"], str):
+                            try:
+                                m["sources"] = __import__("json").loads(m["sources"])
+                            except Exception:
+                                pass
+                    return {**d, "messages": msg_data}
+        except Exception:
+            pass
+        conn = _get_local_db()
+        row = conn.execute("SELECT * FROM chat_sessions WHERE id=?", (session_id,)).fetchone()
+        if row:
+            d = dict(row)
+            if isinstance(d.get("document_ids"), str):
+                try:
+                    d["document_ids"] = __import__("json").loads(d["document_ids"])
+                except Exception:
+                    d["document_ids"] = []
+            ms = conn.execute("SELECT * FROM chat_messages WHERE session_id=? ORDER BY created_at ASC", (session_id,)).fetchall()
+            msg_list = []
+            for m in ms:
+                md = dict(m)
+                if md.get("sources"):
+                    try:
+                        md["sources"] = __import__("json").loads(md["sources"])
+                    except Exception:
+                        pass
+                msg_list.append(md)
+            d["messages"] = msg_list
+            return d
+        return None
+
+    @staticmethod
+    def save_chat_message(session_id: str, role: str, content: str, sources: list = None) -> int:
+        try:
+            client = _get_supabase()
+            if _use_supabase and client:
+                data = {"session_id": session_id, "role": role, "content": content}
+                if role == "assistant" and sources:
+                    data["sources"] = sources
+                client.table("chat_messages").insert(data).execute()
+                client.table("chat_sessions").update({"updated_at": datetime.utcnow().isoformat()}).eq("id", session_id).execute()
+        except Exception:
+            pass
+        conn = _get_local_db()
+        sources_json = __import__("json").dumps(sources) if role == "assistant" and sources else None
+        cur = conn.execute("INSERT INTO chat_messages (session_id, role, content, sources) VALUES (?,?,?,?)",
+                           (session_id, role, content, sources_json))
+        conn.execute("UPDATE chat_sessions SET updated_at=? WHERE id=?", (datetime.utcnow().isoformat(), session_id))
+        conn.commit()
+        return cur.lastrowid or 0
+
+    @staticmethod
+    def update_chat_session_title(session_id: str, title: str):
+        try:
+            client = _get_supabase()
+            if _use_supabase and client:
+                client.table("chat_sessions").update({"title": title}).eq("id", session_id).execute()
+        except Exception:
+            pass
+        conn = _get_local_db()
+        conn.execute("UPDATE chat_sessions SET title=? WHERE id=?", (title, session_id))
+        conn.commit()
+
+    @staticmethod
+    def delete_chat_session(session_id: str):
+        try:
+            client = _get_supabase()
+            if _use_supabase and client:
+                client.table("chat_messages").delete().eq("session_id", session_id).execute()
+                client.table("chat_sessions").delete().eq("id", session_id).execute()
+        except Exception:
+            pass
+        conn = _get_local_db()
+        conn.execute("DELETE FROM chat_messages WHERE session_id=?", (session_id,))
+        conn.execute("DELETE FROM chat_sessions WHERE id=?", (session_id,))
+        conn.commit()
 
 
 def _local_insert(table: str, data: dict):

@@ -100,10 +100,35 @@ class SearchResponse(BaseModel):
     query: str
 
 
+class ChatMessageResponse(BaseModel):
+    id: int = 0
+    session_id: str = ""
+    role: str
+    content: str
+    sources: Optional[list] = None
+    created_at: Optional[str] = None
+
+
+class ChatSessionResponse(BaseModel):
+    id: str
+    organization_id: str
+    document_ids: list[str] = []
+    title: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    messages: list[ChatMessageResponse] = []
+
+
+class ChatSessionListResponse(BaseModel):
+    sessions: list[ChatSessionResponse]
+    total: int
+
+
 class ChatRequest(BaseModel):
-    document_id: str
+    document_id: str = ""
     organization_id: str
     question: str
+    document_ids: Optional[list[str]] = None
     chat_history: Optional[list[dict]] = None
     session_id: Optional[str] = None
 
@@ -113,6 +138,7 @@ class ChatResponse(BaseModel):
     sources: list[dict]
     document_id: str
     history: list[dict] = []
+    session_id: Optional[str] = None
 
 
 class ProcessRequest(BaseModel):
