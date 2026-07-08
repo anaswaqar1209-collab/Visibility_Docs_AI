@@ -411,8 +411,10 @@ class RAGService:
         query_embedding = embedding_service.embed_query(query)
         results = []
         seen_ids = set()
-        seen_docs = set()
+        import re
+        query_words = [w for w in re.sub(r'[^\w\s]', ' ', query).lower().split() if len(w) > 2]
 
+        # 1. Pinecone vector search (handles typos via embeddings)
         if pinecone_service.available:
             filter_dict = {"organization_id": organization_id}
             if document_type:
@@ -433,7 +435,6 @@ class RAGService:
                     if chunk_id in seen_ids:
                         continue
                     seen_ids.add(chunk_id)
-                    seen_docs.add(did)
                     if document_type and dtype != document_type:
                         continue
                     results.append({
@@ -449,6 +450,7 @@ class RAGService:
             else:
                 print(f"[SEARCH] Pinecone returned no results")
 
+        # 2. FTS5 keyword search (prefix matching)
         print(f"[SEARCH] Running keyword search (FTS5)...")
         try:
             from ..database import _local_keyword_search
@@ -463,7 +465,6 @@ class RAGService:
                     if chunk_id in seen_ids:
                         continue
                     seen_ids.add(chunk_id)
-                    seen_docs.add(did)
                     title, dtype = title_map.get(did, ("", ""))
                     if document_type and dtype != document_type:
                         continue
@@ -482,27 +483,42 @@ class RAGService:
         except Exception:
             pass
 
-        if not results:
-            try:
-                like_results = SupabaseDB.select(
+        # 3. Per-word LIKE search (typo-tolerant partial matching)
+        try:
+            like_results = set()
+            seen_like = set()
+            for word in query_words:
+                wr = SupabaseDB.select(
                     "document_chunks",
                     columns="id, document_id, organization_id, page_id, content, metadata",
-                    like={"content": query},
-                    limit=limit * 2,
+                    like={"content": word},
+                    limit=limit,
                 )
-                like_data = getattr(like_results, "data", like_results if isinstance(like_results, list) else [])
-                if isinstance(like_data, list):
-                    doc_ids = list(set(r.get("document_id", "") for r in like_data if isinstance(r, dict)))
+                wdata = getattr(wr, "data", wr if isinstance(wr, list) else [])
+                if isinstance(wdata, list):
+                    for item in wdata:
+                        if isinstance(item, dict) and item.get("id") not in seen_like:
+                            seen_like.add(item.get("id"))
+                            like_results.add(item.get("id"))
+            if like_results:
+                all_like = SupabaseDB.select(
+                    "document_chunks",
+                    columns="id, document_id, organization_id, page_id, content, metadata",
+                    filters={"organization_id": organization_id} if organization_id else None,
+                    limit=limit * 3,
+                )
+                ldata = getattr(all_like, "data", all_like if isinstance(all_like, list) else [])
+                if isinstance(ldata, list):
+                    doc_ids = list(set(r.get("document_id", "") for r in ldata if isinstance(r, dict) and r.get("id") in like_results))
                     title_map = self._fetch_doc_titles(doc_ids, organization_id)
-                    for item in like_data:
-                        if not isinstance(item, dict):
+                    for item in ldata:
+                        if not isinstance(item, dict) or item.get("id") not in like_results:
                             continue
-                        did = item.get("document_id", "")
-                        chunk_id = item.get("id", "")
+                        chunk_id = item.get("id")
                         if chunk_id in seen_ids:
                             continue
                         seen_ids.add(chunk_id)
-                        seen_docs.add(did)
+                        did = item.get("document_id", "")
                         title, dtype = title_map.get(did, ("", ""))
                         if document_type and dtype != document_type:
                             continue
@@ -510,45 +526,43 @@ class RAGService:
                             "document_id": did,
                             "document_title": title,
                             "document_type": dtype,
-                        "chunk_text": item.get("content", "")[:3000],
-                        "page_number": item.get("page_id"),
-                        "score": 0.7,
+                            "chunk_text": item.get("content", "")[:3000],
+                            "page_number": item.get("page_id"),
+                            "score": 0.7,
                             "metadata": item.get("metadata"),
                         })
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        if not results:
-            try:
-                vector_results = SupabaseDB.search_vector(
-                    "document_chunks",
-                    query_embedding,
-                    match_threshold=0.6,
-                    match_count=limit * 2,
-                    filter_org_id=organization_id,
-                )
-            except Exception:
-                vector_results = {"data": []}
+        # 4. Supabase vector search (handles typos via embeddings)
+        try:
+            vector_results = SupabaseDB.search_vector(
+                "document_chunks",
+                query_embedding,
+                match_threshold=0.5,
+                match_count=limit * 2,
+                filter_org_id=organization_id,
+            )
+        except Exception:
+            vector_results = {"data": []}
 
-            for item in getattr(vector_results, "data", vector_results if isinstance(vector_results, list) else []):
-                chunk = item if isinstance(item, dict) else {}
-                chunk_id = chunk.get("id", "")
-                if chunk_id in seen_ids:
-                    continue
-                seen_ids.add(chunk_id)
-                doc_type_match = True
-                if document_type:
-                    doc_type_match = chunk.get("document_type") == document_type
-                if doc_type_match:
-                    results.append({
-                        "document_id": chunk.get("document_id", ""),
-                        "document_title": chunk.get("document_title", ""),
-                        "document_type": chunk.get("document_type"),
-                        "chunk_text": chunk.get("content", chunk.get("chunk_text", "")),
-                        "page_number": chunk.get("page_number", chunk.get("page_id")),
-                        "score": chunk.get("similarity", chunk.get("score", 0)),
-                        "metadata": chunk.get("metadata"),
-                    })
+        for item in getattr(vector_results, "data", vector_results if isinstance(vector_results, list) else []):
+            chunk = item if isinstance(item, dict) else {}
+            chunk_id = chunk.get("id", "")
+            if chunk_id in seen_ids:
+                continue
+            seen_ids.add(chunk_id)
+            if document_type and chunk.get("document_type") != document_type:
+                continue
+            results.append({
+                "document_id": chunk.get("document_id", ""),
+                "document_title": chunk.get("document_title", ""),
+                "document_type": chunk.get("document_type"),
+                "chunk_text": chunk.get("content", chunk.get("chunk_text", "")),
+                "page_number": chunk.get("page_number", chunk.get("page_id")),
+                "score": chunk.get("similarity", chunk.get("score", 0)),
+                "metadata": chunk.get("metadata"),
+            })
 
         results = sorted(results, key=lambda x: x["score"], reverse=True)
         if document_ids:
