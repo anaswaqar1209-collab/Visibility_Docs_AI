@@ -76,8 +76,27 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [selectedChatDocs, setSelectedChatDocs] = useState<any[]>([]);
   const [agentFilter, setAgentFilter] = useState("");
+  const [sendingReport, setSendingReport] = useState(false);
 
   const showToast = useCallback((m: string) => { setToast(m); setTimeout(() => setToast(""), 3000); }, []);
+
+  const sendReport = async () => {
+    setSendingReport(true);
+    try {
+      const r = await authFetch(token, `${API}/api/v1/reports/email?organization_id=${orgId}&phase3_agent=${agentFilter}`, { method: "POST" });
+      if (r.ok) {
+        const data = await r.json();
+        showToast(`📧 Report sent to ${data.sent_to}`);
+      } else {
+        const err = await r.json().catch(() => ({}));
+        showToast(`❌ ${err.detail || "Failed to send report"}`);
+      }
+    } catch {
+      showToast("❌ Network error sending report");
+    } finally {
+      setSendingReport(false);
+    }
+  };
 
   useEffect(() => {
     if (!loading && !user) router.push("/login");
@@ -115,6 +134,10 @@ export default function Home() {
                 📄 Documents
               </button>
             </div>
+            <button onClick={sendReport} disabled={sendingReport}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition-all disabled:opacity-50">
+              {sendingReport ? "⏳ Sending..." : "📧 Email Report"}
+            </button>
             <div className="flex items-center gap-3 pl-4 border-l border-slate-200">
               <span className="text-xs text-slate-400 hidden sm:block">{user?.email}</span>
               <button onClick={async () => { await logout(); router.push("/login"); }}

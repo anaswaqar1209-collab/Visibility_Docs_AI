@@ -15,7 +15,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
-from .routers import documents, search, chat, auth
+from .routers import documents, search, chat, auth, reports
 from .auth_deps import get_current_user, get_optional_user
 from fastapi import Depends
 from .config import settings
@@ -100,6 +100,7 @@ app.include_router(auth.router)
 app.include_router(documents.router, dependencies=[Depends(get_optional_user)])
 app.include_router(search.router, dependencies=[Depends(get_optional_user)])
 app.include_router(chat.router, dependencies=[Depends(get_optional_user)])
+app.include_router(reports.router, dependencies=[Depends(get_current_user)])
 
 
 @app.get("/", tags=["status"])
