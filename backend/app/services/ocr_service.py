@@ -1,8 +1,10 @@
 import os
+import re
 import base64
 import io
 import tempfile
 import logging
+from enum import Enum
 import fitz
 from PIL import Image
 from ..config import settings
@@ -10,107 +12,305 @@ from ..config import settings
 logger = logging.getLogger("visibility-docs")
 
 
-class OCRService:
-    _BATCH_SIZE = 5
-    _MAX_WIDTH = 768
-    _JPEG_QUALITY = 80
+class FileType(str, Enum):
+    DIGITAL_PDF = "digital_pdf"
+    SCANNED_PDF = "scanned_pdf"
+    DOCX = "docx"
+    TXT = "txt"
+    IMAGE = "image"
 
-    def pdf_to_images(self, pdf_path: str, max_width: int = None, quality: int = None) -> list[dict]:
-        doc = fitz.open(pdf_path)
-        tmp_dir = tempfile.mkdtemp(prefix="ocr_")
-        max_width = max_width or self._MAX_WIDTH
-        quality = quality or self._JPEG_QUALITY
-        pages = []
-        for i, page in enumerate(doc):
-            page_pix = page.get_pixmap(dpi=150)
-            img = Image.frombytes("RGB", [page_pix.width, page_pix.height], page_pix.samples)
-            w_percent = max_width / float(img.width)
-            h_size = int(float(img.height) * float(w_percent))
-            img = img.resize((max_width, h_size), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality, optimize=True)
-            buf.seek(0)
-            b64 = base64.b64encode(buf.read()).decode("utf-8")
-            out = os.path.join(tmp_dir, f"page_{i+1:04d}.jpg")
-            img.save(out, format="JPEG", quality=quality, optimize=True)
-            pages.append({"path": out, "b64": b64, "page_num": i + 1, "size": len(b64)})
-        doc.close()
-        return pages
 
-    def _extract_pymupdf_text(self, file_path: str) -> tuple[str, int]:
+ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
+TEXT_IMAGE_EXT = ALLOWED_IMAGE_EXT | {".pdf", ".docx", ".txt"}
+
+
+def _is_image_ext(ext: str) -> bool:
+    return ext.lower() in ALLOWED_IMAGE_EXT
+
+
+def detect_file_type(file_path: str) -> FileType:
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".docx":
+        return FileType.DOCX
+    if ext == ".txt":
+        return FileType.TXT
+    if _is_image_ext(ext):
+        return FileType.IMAGE
+    if ext == ".pdf":
         try:
             doc = fitz.open(file_path)
             page_count = doc.page_count
-            text = ""
+            text_len = 0
             for page in doc:
-                text += page.get_text()
+                text_len += len(page.get_text().strip())
             doc.close()
-            return text, page_count
-        except Exception:
-            return "", 0
+            avg_chars = text_len / max(page_count, 1)
+            if avg_chars > 50:
+                return FileType.DIGITAL_PDF
+            return FileType.SCANNED_PDF
+        except Exception as e:
+            logger.warning(f"PDF detection failed for {file_path}: {e}")
+            return FileType.SCANNED_PDF
 
-    def _is_text_sufficient(self, text: str, page_count: int) -> bool:
-        if page_count == 0:
-            return False
-        return len(text.strip()) / page_count > 50
+    logger.warning(f"Unknown file type for {file_path}, treating as scanned")
+    return FileType.SCANNED_PDF
 
-    def _vision_ocr(self, pages: list[dict]) -> str:
-        from .groq_service import groq_service
 
-        if not groq_service.available or not groq_service.vision_available:
-            logger.warning("Groq vision not available, falling back to direct text")
-            return ""
+def _extract_digital_pdf(file_path: str) -> str:
+    doc = fitz.open(file_path)
+    pages = []
+    for page_num, page in enumerate(doc, 1):
+        blocks = page.get_text("dict").get("blocks", [])
+        page_lines = []
+        for block in blocks:
+            btype = block.get("type", 0)
+            if btype == 0:
+                for line in block.get("lines", []):
+                    spans = line.get("spans", [])
+                    if not spans:
+                        continue
+                    text = "".join(s.get("text", "") for s in spans)
+                    font_size = max(s.get("size", 12) for s in spans)
+                    flags = spans[0].get("flags", 0)
+                    is_bold = bool(flags & 16) or "bold" in spans[0].get("font", "").lower()
 
-        texts = []
-        for i in range(0, len(pages), self._BATCH_SIZE):
-            batch = pages[i:i + self._BATCH_SIZE]
-            content = [{"type": "text", "text": "You are an OCR engine. This is a document page image — treat it as a TEXT PAGE, not a photograph. Extract EVERY character, word, and number exactly as it appears. Preserve paragraphs, line breaks, and formatting. Output ONLY the extracted text with no commentary, no descriptions, no formatting markers. Prefix each page with '--- Page X ---'."}]
-            for p in batch:
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{p['b64']}"}})
+                    if is_bold and font_size > 11:
+                        text = f"## {text.strip()}"
+                    page_lines.append(text.strip())
+            elif btype == 1:
+                page_lines.append("[IMAGE]")
+        page_text = "\n".join(line for line in page_lines if line)
+        pages.append(f"<!-- Page {page_num} -->\n{page_text}")
+    doc.close()
+    result = "\n\n".join(pages)
+    result = _normalize_markdown(result)
+    return result
+
+
+def _extract_docx(file_path: str) -> str:
+    from docx import Document
+    doc = Document(file_path)
+    parts = []
+    for para in doc.paragraphs:
+        style = para.style.name.lower() if para.style else ""
+        text = para.text.strip()
+        if not text:
+            parts.append("")
+            continue
+        if "heading" in style or "title" in style:
             try:
-                result = groq_service.chat_vision(
-                    [{"role": "user", "content": content}],
-                    temperature=0.0,
-                    max_tokens=4096,
-                )
-                if result and not result.startswith("[Groq"):
-                    texts.append(result)
-                else:
-                    texts.append("")
-            except Exception as e:
-                logger.warning(f"Vision OCR batch {i//self._BATCH_SIZE + 1} failed: {e}")
+                level = int(re.search(r"heading\s*(\d+)", style).group(1))
+                parts.append(f"{'#' * level} {text}")
+            except Exception:
+                parts.append(f"## {text}")
+        elif any(r.bold for r in para.runs if r.bold):
+            parts.append(f"**{text}**")
+        else:
+            parts.append(text)
+
+    tables = []
+    for table in doc.tables:
+        md_rows = []
+        for row_idx, row in enumerate(table.rows):
+            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            md_rows.append("| " + " | ".join(cells) + " |")
+            if row_idx == 0:
+                md_rows.append("| " + " | ".join("---" for _ in cells) + " |")
+        tables.append("\n".join(md_rows))
+
+    result = "\n".join(parts)
+    if tables:
+        result += "\n\n" + "\n\n".join(tables)
+    result = _normalize_markdown(result)
+    return result
+
+
+def _extract_txt(file_path: str) -> str:
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                return f.read()
+        except (UnicodeError, Exception):
+            continue
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _page_to_image(page) -> str:
+    pix = page.get_pixmap(dpi=150)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    target_w = 768
+    w_percent = target_w / float(img.width)
+    h_size = int(float(img.height) * float(w_percent))
+    img = img.resize((target_w, h_size), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _load_image_b64(file_path: str) -> str:
+    target_w = 768
+    img = Image.open(file_path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    w_percent = target_w / float(img.width)
+    h_size = int(float(img.height) * float(w_percent))
+    img = img.resize((target_w, h_size), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+VISION_PROMPT = """You are an OCR engine. Extract ALL visible text from this document page image.
+
+Rules:
+- Extract every character, word, number exactly as it appears
+- Preserve layout: headings, paragraphs, bullet lists, numbered lists, tables
+- Output tables as Markdown tables
+- If the image contains a diagram, engineering drawing, chart, or figure, extract all visible labels and annotations
+- Prefix each page with '--- Page X ---'
+- Output ONLY clean Markdown — no explanations, no summaries, no commentary
+- NEVER convert tables into paragraphs — always use Markdown table syntax
+- Preserve figure labels, captions, warnings, notes, cautions as they appear"""
+
+
+def _vision_ocr(image_b64s: list[str]) -> str:
+    from .groq_service import groq_service
+    if not groq_service.available or not groq_service.vision_available:
+        logger.warning("Groq vision not available")
+        return ""
+
+    texts = []
+    batch_size = 5
+    for i in range(0, len(image_b64s), batch_size):
+        batch = image_b64s[i:i + batch_size]
+        content = [{"type": "text", "text": VISION_PROMPT}]
+        for b64 in batch:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        try:
+            result = groq_service.chat_vision(
+                [{"role": "user", "content": content}],
+                temperature=0.0,
+                max_tokens=8192,
+            )
+            if result and not result.startswith("[Groq"):
+                texts.append(result)
+            else:
                 texts.append("")
+        except Exception as e:
+            logger.warning(f"Vision batch {i//batch_size + 1} failed: {e}")
+            texts.append("")
 
-        return "\n\n".join(texts)
-
-    def process_document(self, file_path: str) -> dict:
-        ext = os.path.splitext(file_path)[1].lower()
-        logger.info(f"[OCR] Processing: {file_path}")
-
-        if ext == ".pdf":
-            direct_text, page_count = self._extract_pymupdf_text(file_path)
-            logger.info(f"[OCR] PyMuPDF: {len(direct_text)} chars, {page_count} pages")
-            if self._is_text_sufficient(direct_text, page_count):
-                logger.info(f"[OCR] Direct text sufficient ({len(direct_text.strip())//max(page_count,1)} chars/page)")
-                return {"text": direct_text, "page_count": page_count, "source": "direct"}
-            logger.info(f"[OCR] Direct text insufficient, using vision OCR")
-
-        pages = self.pdf_to_images(file_path)
-        logger.info(f"[OCR] Converted to {len(pages)} JPEG images (768px, {self._JPEG_QUALITY}% quality)")
-
-        t0 = __import__("time").time()
-        text = self._vision_ocr(pages)
-        duration = __import__("time").time() - t0
-        logger.info(f"[OCR] Vision done: {len(text)} chars in {duration:.1f}s ({len(pages)} pages)")
-
-        if not text.strip():
-            logger.warning("[OCR] Vision returned empty, trying direct text fallback")
-            direct_text, page_count = self._extract_pymupdf_text(file_path)
-            if direct_text.strip():
-                return {"text": direct_text, "page_count": page_count, "source": "direct_fallback"}
-            text = "[OCR failed]"
-
-        return {"text": text, "page_count": len(pages), "source": "vision"}
+    return "\n\n".join(texts)
 
 
-ocr_service = OCRService()
+def process_scanned_pdf(file_path: str) -> str:
+    doc = fitz.open(file_path)
+    b64s = []
+    for page in doc:
+        b64s.append(_page_to_image(page))
+    doc.close()
+
+    if not b64s:
+        return ""
+
+    text = _vision_ocr(b64s)
+    if text.strip():
+        text = _normalize_markdown(text)
+        return text
+
+    logger.warning("Vision returned empty for scanned PDF, trying PyMuPDF fallback")
+    try:
+        doc = fitz.open(file_path)
+        parts = []
+        for page in doc:
+            t = page.get_text().strip()
+            if t:
+                parts.append(t)
+        doc.close()
+        fallback = "\n\n".join(parts)
+        return _normalize_markdown(fallback) if fallback else "[OCR failed]"
+    except Exception:
+        return "[OCR failed]"
+
+
+def process_image(file_path: str) -> str:
+    b64 = _load_image_b64(file_path)
+    text = _vision_ocr([b64])
+    if text.strip():
+        return _normalize_markdown(text)
+    return "[OCR failed]"
+
+
+def _normalize_markdown(text: str) -> str:
+    text = re.sub(r'\r\n', '\n', text)
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    text = re.sub(r'[ \t]+$', '', text, flags=re.MULTILINE)
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^#{1,6}\s', stripped):
+            result.append(stripped)
+        elif re.match(r'^[-*]\s', stripped):
+            result.append(stripped)
+        elif re.match(r'^\d+[.)]\s', stripped):
+            result.append(stripped)
+        elif re.match(r'^\|', stripped):
+            result.append(stripped)
+        elif re.match(r'^>\s', stripped):
+            result.append(stripped)
+        elif re.match(r'^```', stripped):
+            result.append(stripped)
+        else:
+            result.append(line)
+    return '\n'.join(result)
+
+
+def process_document(file_path: str) -> dict:
+    file_type = detect_file_type(file_path)
+    logger.info(f"[OCR] Detected: {file_type.value} — {file_path}")
+
+    text = ""
+    page_count = 0
+
+    if file_type == FileType.DIGITAL_PDF:
+        text = _extract_digital_pdf(file_path)
+        if text:
+            doc = fitz.open(file_path)
+            page_count = doc.page_count
+            doc.close()
+        source = "digital_pdf"
+
+    elif file_type == FileType.DOCX:
+        text = _extract_docx(file_path)
+        page_count = max(1, len(text) // 2000)
+        source = "docx"
+
+    elif file_type == FileType.TXT:
+        text = _extract_txt(file_path)
+        page_count = max(1, len(text) // 2000)
+        source = "txt"
+
+    elif file_type == FileType.SCANNED_PDF:
+        text = process_scanned_pdf(file_path)
+        if text and text != "[OCR failed]":
+            try:
+                doc = fitz.open(file_path)
+                page_count = doc.page_count
+                doc.close()
+            except Exception:
+                page_count = 0
+        source = "vision"
+
+    elif file_type == FileType.IMAGE:
+        text = process_image(file_path)
+        page_count = 1
+        source = "vision"
+
+    logger.info(f"[OCR] Result: {len(text)} chars, {page_count} pages, source={source}")
+    return {"text": text, "page_count": page_count, "source": source}
+
+
+ocr_service = type("OCRService", (), {"process_document": staticmethod(process_document)})()

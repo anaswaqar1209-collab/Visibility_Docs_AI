@@ -1,3 +1,4 @@
+import re
 import hashlib
 from ..database import SupabaseDB
 from ..config import settings
@@ -120,7 +121,11 @@ def _detect_headings_from_text(text: str) -> list[dict]:
         stripped = line.strip()
         if not stripped:
             continue
-        if numbered_re.match(stripped):
+        md_match = re.match(r'^(#{1,6})\s+(.+)', stripped)
+        if md_match:
+            level = len(md_match.group(1))
+            headings.append({"heading": md_match.group(2), "level": level})
+        elif numbered_re.match(stripped):
             prev_line = lines[idx - 1].strip() if idx > 0 else ""
             if prev_line and len(prev_line) > 3 and not numbered_re.match(prev_line):
                 headings.append({"heading": stripped, "level": 3})
@@ -251,10 +256,189 @@ def _chunk_by_sections(text: str, headings: list[dict], max_words: int = 350) ->
     return chunks
 
 
+ATOMIC_PATTERNS = [
+    (re.compile(r'^\|.+\|$'), "table"),
+    (re.compile(r'^```'), "code_block"),
+    (re.compile(r'^(?:>?\s*)?(?:\*\*)?(?:Warning|Note|Caution|Important|Notice|Danger|Info)(?:\*\*)?\s*[:]?\s*', re.IGNORECASE), "admonition"),
+    (re.compile(r'^\s*(?:-\s+|\*\s+|\d+[.)]\s+)'), "list_item"),
+]
+
+
+def _is_atomic_start(line: str) -> str | None:
+    for pat, atype in ATOMIC_PATTERNS:
+        if pat.match(line):
+            return atype
+    return None
+
+
+def _parse_atomic_blocks(text: str) -> list[dict]:
+    lines = text.split('\n')
+    blocks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        atype = _is_atomic_start(stripped)
+
+        if atype == "code_block":
+            block_lines = [line]
+            i += 1
+            while i < len(lines):
+                block_lines.append(lines[i])
+                if lines[i].strip().startswith("```"):
+                    break
+                i += 1
+            blocks.append({"type": "code", "content": "\n".join(block_lines), "words": len(" ".join(block_lines).split())})
+            i += 1
+
+        elif stripped.startswith("|") and stripped.endswith("|"):
+            table_lines = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "table", "content": "\n".join(table_lines), "words": len(" ".join(table_lines).split())})
+
+        elif not stripped:
+            i += 1
+            continue
+
+        elif atype == "admonition":
+            admon_lines = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip() and not _is_atomic_start(lines[i].strip()):
+                admon_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "admonition", "content": "\n".join(admon_lines), "words": len(" ".join(admon_lines).split())})
+
+        elif re.match(r'^\d+[.)]\s', stripped):
+            list_lines = [line]
+            i += 1
+            while i < len(lines) and re.match(r'^\d+[.)]\s', lines[i].strip()):
+                list_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "numbered_list", "content": "\n".join(list_lines), "words": len(" ".join(list_lines).split())})
+
+        elif re.match(r'^[-*]\s', stripped):
+            list_lines = [line]
+            i += 1
+            while i < len(lines) and re.match(r'^[-*]\s', lines[i].strip()):
+                list_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "bullet_list", "content": "\n".join(list_lines), "words": len(" ".join(list_lines).split())})
+
+        elif stripped.startswith("---"):
+            i += 1
+            continue
+
+        elif stripped.startswith("<!--"):
+            i += 1
+            continue
+
+        else:
+            para_lines = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip() and not _is_atomic_start(lines[i].strip()):
+                stripped_next = lines[i].strip()
+                if re.match(r'^\d+[.)]\s', stripped_next) or re.match(r'^[-*]\s', stripped_next):
+                    break
+                para_lines.append(lines[i])
+                i += 1
+            text_content = "\n".join(para_lines)
+            blocks.append({"type": "paragraph", "content": text_content, "words": len(text_content.split())})
+
+    return blocks
+
+
+def _markdown_aware_chunk(text: str, max_words: int = 250) -> list[dict]:
+    if not text:
+        return []
+
+    blocks = _parse_atomic_blocks(text)
+    if not blocks:
+        return []
+
+    chunks = []
+    current_blocks = []
+    current_words = 0
+    chunk_id = 0
+    current_heading = None
+
+    for block in blocks:
+        bw = block["words"]
+        if bw > max_words:
+            if current_blocks:
+                ct = "\n\n".join(b["content"] for b in current_blocks)
+                chunks.append({
+                    "content": ct,
+                    "chunk_id": hashlib.md5(ct.encode()).hexdigest(),
+                    "chunk_index": chunk_id,
+                    "word_count": current_words,
+                    "heading": current_heading,
+                    "chunk_type": "markdown_section",
+                })
+                chunk_id += 1
+                current_blocks = []
+                current_words = 0
+
+            ct = block["content"]
+            chunks.append({
+                "content": ct,
+                "chunk_id": hashlib.md5(ct.encode()).hexdigest(),
+                "chunk_index": chunk_id,
+                "word_count": bw,
+                "heading": current_heading,
+                "chunk_type": block["type"],
+            })
+            chunk_id += 1
+            continue
+
+        if current_words + bw > max_words and current_blocks:
+            ct = "\n\n".join(b["content"] for b in current_blocks)
+            chunks.append({
+                "content": ct,
+                "chunk_id": hashlib.md5(ct.encode()).hexdigest(),
+                "chunk_index": chunk_id,
+                "word_count": current_words,
+                "heading": current_heading,
+                "chunk_type": "markdown_section",
+            })
+            chunk_id += 1
+            current_blocks = [block]
+            current_words = bw
+        else:
+            current_blocks.append(block)
+            current_words += bw
+
+        content = block["content"]
+        first_line = content.split("\n")[0].strip()
+        if first_line.startswith("#"):
+            current_heading = first_line.lstrip("#").strip()
+        elif first_line.startswith("##"):
+            current_heading = first_line.lstrip("#").strip()
+
+    if current_blocks:
+        ct = "\n\n".join(b["content"] for b in current_blocks)
+        chunks.append({
+            "content": ct,
+            "chunk_id": hashlib.md5(ct.encode()).hexdigest(),
+            "chunk_index": chunk_id,
+            "word_count": current_words,
+            "heading": current_heading,
+            "chunk_type": "markdown_section",
+        })
+
+    return chunks
+
+
 class RAGService:
     def chunk_text(self, text: str, max_words: int = 250) -> list[dict]:
         if not text:
             return []
+
+        chunks = _markdown_aware_chunk(text, max_words)
+        if chunks:
+            return chunks
 
         import re
         sentences = re.split(r'(?<=[.!?])\s+', text)
