@@ -186,8 +186,7 @@ class ChatService:
                     if resolved_ids:
                         resolved_set = set(resolved_ids)
                         resumes = [r for r in resumes if r["id"] in resolved_set]
-                    for r in resumes:
-                        document_service._attach_cv_extraction(r, organization_id)
+                    document_service._batch_attach_extractions(resumes, organization_id)
                     resumes = [r for r in resumes if r.get("cv_score") is not None]
                     resumes.sort(key=lambda x: x.get("cv_score", 0) or 0, reverse=True)
                 except Exception:
@@ -275,8 +274,7 @@ class ChatService:
                 if resolved_ids:
                     resolved_set = set(resolved_ids)
                     resumes = [r for r in resumes if r["id"] in resolved_set]
-                for r in resumes:
-                    document_service._attach_cv_extraction(r, organization_id)
+                document_service._batch_attach_extractions(resumes, organization_id)
                 resumes = [r for r in resumes if r.get("cv_score") is not None]
                 resumes.sort(key=lambda x: x.get("cv_score", 0) or 0, reverse=True)
             except Exception:

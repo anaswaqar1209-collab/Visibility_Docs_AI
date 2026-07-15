@@ -110,6 +110,45 @@ class DocumentService:
             return doc
         return data if isinstance(data, dict) else None
 
+    def _batch_attach_extractions(self, docs: list[dict], organization_id: str):
+        """Batch-fetch document_extractions for all docs in one query, attach cv_score to resumes."""
+        resume_ids = [d["id"] for d in docs if d.get("document_type") == "resume"]
+        if not resume_ids:
+            return
+        try:
+            import json
+            from ..database import _local_select_in, _get_supabase, _use_supabase
+            unique_ids = list(set(resume_ids))
+            client = _get_supabase()
+            if _use_supabase and client:
+                r = client.table("document_extractions") \
+                    .select("document_id, extracted_data") \
+                    .in_("document_id", unique_ids) \
+                    .eq("organization_id", organization_id) \
+                    .execute()
+                rows = getattr(r, "data", [])
+            else:
+                rows = _local_select_in("document_extractions",
+                    columns="document_id, extracted_data",
+                    filters={"organization_id": organization_id},
+                    in_column="document_id", in_values=unique_ids)
+            scores = {}
+            for row in rows:
+                raw = row.get("extracted_data", "{}")
+                if isinstance(raw, str):
+                    parsed = json.loads(raw)
+                else:
+                    parsed = raw or {}
+                ev = parsed.get("cv_evaluation") or {}
+                score = ev.get("overall_score")
+                if score is not None:
+                    scores[row["document_id"]] = float(score)
+            for d in docs:
+                if d["id"] in scores:
+                    d["cv_score"] = scores[d["id"]]
+        except Exception:
+            pass
+
     def list_documents(self, organization_id: str, limit: int = 50, offset: int = 0, search: str = "", phase3_agent: str = "") -> list[dict]:
         filters = {"organization_id": organization_id}
         if phase3_agent:
@@ -119,9 +158,8 @@ class DocumentService:
         data = getattr(result, "data", result if isinstance(result, list) else [])
         docs = data if isinstance(data, list) else []
 
-        # Attach cv_score for resume documents
-        for d in docs:
-            self._attach_cv_extraction(d, organization_id)
+        # Batch-attach cv_score for resume documents (single query instead of N queries)
+        self._batch_attach_extractions(docs, organization_id)
 
         return docs
 
