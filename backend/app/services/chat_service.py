@@ -88,8 +88,11 @@ class ChatService:
             totals = {}
             parsed_count = 0
 
+            # Group extractions by document_id, merging image data into main extraction
+            doc_extractions = {}
             for row in rows:
                 did = row.get("document_id", "")
+                ext_type = row.get("extraction_type", "")
                 raw = row.get("extracted_data", "{}")
                 if isinstance(raw, str):
                     try:
@@ -101,9 +104,20 @@ class ChatService:
                 if not isinstance(parsed, dict):
                     continue
 
+                if did not in doc_extractions:
+                    doc_extractions[did] = {"type": ext_type, "data": {}}
+                if ext_type == "image_extraction":
+                    doc_extractions[did]["has_images"] = True
+                    doc_extractions[did]["images"] = parsed.get("images", [])
+                else:
+                    doc_extractions[did]["type"] = ext_type
+                    doc_extractions[did]["data"].update(parsed)
+
+            for did, ext_info in doc_extractions.items():
+                parsed = ext_info["data"]
                 title = doc_info.get(did, did)
                 lines.append(f"\n  Document: {title}  (id: {did})")
-                lines.append(f"  Type: {row.get('extraction_type', 'document')}")
+                lines.append(f"  Type: {ext_info['type']}")
 
                 for key, val in parsed.items():
                     if key.startswith("_"):
@@ -113,6 +127,10 @@ class ChatService:
                     elif isinstance(val, (int, float)):
                         lines.append(f"    {key}: {val}")
                         totals[key] = totals.get(key, 0) + val
+
+                if ext_info.get("has_images"):
+                    img_count = len(ext_info.get("images", []))
+                    lines.append(f"    images: {img_count} image(s) with vision descriptions in document context")
                 parsed_count += 1
 
             if parsed_count > 1 and totals:
