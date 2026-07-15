@@ -794,6 +794,13 @@ function ChatSection({ showToast, selectedDocs, setSelectedDocs, orgId, token, a
     const matchSearch = !searchQuery || (d.title || "").toLowerCase().includes(searchQuery.toLowerCase());
     const matchAgent = !agentFilter || getDocAgent(d) === agentFilter;
     return matchSearch && matchAgent;
+  }).sort((a: any, b: any) => {
+    const aResume = a.document_type === "resume" && a.cv_score != null;
+    const bResume = b.document_type === "resume" && b.cv_score != null;
+    if (aResume && bResume) return (b.cv_score || 0) - (a.cv_score || 0);
+    if (aResume) return -1;
+    if (bResume) return 1;
+    return 0;
   });
 
   const filteredSessions = sessions.filter((s: any) =>
@@ -936,6 +943,11 @@ function ChatSection({ showToast, selectedDocs, setSelectedDocs, orgId, token, a
                       <p className="text-xs font-semibold text-slate-800 truncate">{doc.title || "Untitled"}</p>
                       <div className="flex gap-1 mt-0.5">
                         <span className={`badge badge-xs ${typeColor(doc.document_type)}`}>{doc.document_type || "unknown"}</span>
+                        {doc.document_type === "resume" && doc.cv_score != null && (
+                          <span className={`badge badge-xs ${doc.cv_score >= 70 ? "badge-success" : doc.cv_score >= 40 ? "badge-warning" : "badge-error"}`}>
+                            {doc.cv_score}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>

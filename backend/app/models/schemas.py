@@ -94,6 +94,7 @@ class SearchResult(BaseModel):
     document_id: str
     document_title: str
     document_type: Optional[str] = None
+    cv_score: Optional[float] = None
     chunk_text: str
     page_number: Optional[int] = None
     score: float

@@ -1,9 +1,16 @@
 import time
 from .conversation_service import conversation_service
 from .rag_service import rag_service
+from .document_service import document_service
 from ..database import SupabaseDB
 from .orchestration_logger import get_chat_logger, C
 from .agent_orchestrator import _load_phase3_prompt, _load_prompt, DOCUMENT_TO_PHASE3_AGENT, PHASE3_AGENT_PROMPT_MAP
+
+_RESUME_KEYWORDS = ["resume", "cv ", "candidate", "applicant", "hiring", "recruit",
+                    "top.*resume", "best.*candidate", "rank.*resume", "score.*resume",
+                    "sorted.*resume", "highest.*score", "top.*candidate",
+                    "give me.*top", "list.*resume", "show.*candidate", "list.*candidate",
+                    "top.*resume", "recommend.*candidate", "best.*fit"]
 
 
 class ChatService:
@@ -17,7 +24,10 @@ class ChatService:
                 is_first = len(messages) == 0
                 if messages:
                     conversation_service.load_history_from_db(session_id, messages)
-                return session_id, stored_ids, is_first
+                resolved = document_ids if document_ids is not None else stored_ids
+                if document_ids is not None and set(document_ids) != set(stored_ids):
+                    SupabaseDB.update_chat_session_doc_ids(session_id, document_ids)
+                return session_id, resolved, is_first
         doc_list = document_ids or []
         new_id = SupabaseDB.create_chat_session(organization_id, "New Chat", doc_list)
         return new_id, doc_list, True
@@ -57,25 +67,62 @@ class ChatService:
         )
         search_results = rag_service.hybrid_search(**hybrid_kwargs)
 
+        q_lower = question.lower()
+        is_resume_query = any(
+            __import__("re").search(kw, q_lower) for kw in _RESUME_KEYWORDS
+        )
+
         if not search_results:
+            resumes = []
+            if is_resume_query:
+                try:
+                    resumes = document_service.list_documents(organization_id)
+                    if resolved_ids:
+                        resolved_set = set(resolved_ids)
+                        resumes = [r for r in resumes if r["id"] in resolved_set]
+                    for r in resumes:
+                        document_service._attach_cv_extraction(r, organization_id)
+                    resumes = [r for r in resumes if r.get("cv_score") is not None]
+                    resumes.sort(key=lambda x: x.get("cv_score", 0) or 0, reverse=True)
+                except Exception:
+                    resumes = []
+
+            resume_context = ""
+            resume_sources = []
+            if resumes:
+                lines = ["[Resume Rankings (sorted by CV evaluation score)]"]
+                for i, r in enumerate(resumes[:20], 1):
+                    score_str = f"{r['cv_score']}/100" if r["cv_score"] is not None else "N/A"
+                    lines.append(f"{i}. {r['title']} — {score_str}")
+                    resume_sources.append({
+                        "document_id": r["id"],
+                        "document_title": r["title"],
+                        "cv_score": r.get("cv_score"),
+                        "score": r.get("cv_score", 0) / 100.0,
+                    })
+                resume_context = "\n".join(lines)
+
             chat_log.search_strategy("Context Building", "no results found")
             chat_log.warn("No relevant documents found in search")
             chat_log.llm_call("llama-3.3-70b-versatile", 0, len(question), 0)
+            system_prompt = ""
+            if resume_context:
+                system_prompt = "You are a Resume Screening assistant. Use the [Resume Rankings] block to answer ranking/comparison questions. Do not make up information."
             if is_first:
-                answer = "I could not find any relevant information in the selected documents."
                 llm_t0 = time.time()
-                conversation_service.chat(question, "", session_id=sid)
+                answer = conversation_service.chat(question, resume_context, session_id=sid,
+                    system_prompt=system_prompt)
                 chat_log.llm_response(time.time() - llm_t0, len(answer))
             else:
                 llm_t0 = time.time()
-                answer = conversation_service.chat(question, "", session_id=sid, is_followup=True)
+                answer = conversation_service.chat(question, resume_context, session_id=sid, is_followup=True)
                 chat_log.llm_response(time.time() - llm_t0, len(answer))
-            self._save_exchange(sid, question, answer, [], is_first)
+            self._save_exchange(sid, question, answer, resume_sources[:5], is_first)
             total = time.time() - t_start
             chat_log.chat_end(total, 0)
             return {
                 "answer": answer,
-                "sources": [],
+                "sources": resume_sources[:5],
                 "document_id": resolved_ids[0] if resolved_ids else "",
                 "history": conversation_service.get_history(sid),
                 "session_id": sid,
@@ -89,6 +136,7 @@ class ChatService:
                 "document_id": r["document_id"],
                 "document_title": r["document_title"],
                 "document_type": r.get("document_type", ""),
+                "cv_score": r.get("cv_score"),
                 "phase3_agent": r.get("phase3_agent", ""),
                 "page_number": r["page_number"],
                 "score": r["score"],
@@ -96,6 +144,45 @@ class ChatService:
 
         context = "\n\n".join(context_parts)
         context_len = len(context)
+
+        # ── Attach file_url to sources for frontend file name display ──
+        try:
+            unique_ids = list(set(s["document_id"] for s in sources))
+            if unique_ids:
+                file_result = SupabaseDB.select("documents",
+                    columns="id, original_file_url",
+                    filters={"organization_id": organization_id},
+                )
+                file_data = getattr(file_result, "data", file_result if isinstance(file_result, list) else [])
+                if isinstance(file_data, list):
+                    id_to_url = {row["id"]: row.get("original_file_url", "") for row in file_data if row.get("id") in unique_ids}
+                    for s in sources:
+                        s["file_url"] = id_to_url.get(s["document_id"], "")
+        except Exception:
+            pass
+
+        # ── Resume ranking: if query mentions resumes, inject sorted scores ──
+        resumes = []
+        if is_resume_query:
+            try:
+                resumes = document_service.list_documents(organization_id)
+                if resolved_ids:
+                    resolved_set = set(resolved_ids)
+                    resumes = [r for r in resumes if r["id"] in resolved_set]
+                for r in resumes:
+                    document_service._attach_cv_extraction(r, organization_id)
+                resumes = [r for r in resumes if r.get("cv_score") is not None]
+                resumes.sort(key=lambda x: x.get("cv_score", 0) or 0, reverse=True)
+            except Exception:
+                resumes = []
+            if resumes:
+                lines = ["[Resume Rankings (sorted by CV evaluation score)]"]
+                for i, r in enumerate(resumes[:20], 1):
+                    score_str = f"{r['cv_score']}/100" if r["cv_score"] is not None else "N/A"
+                    lines.append(f"{i}. {r['title']} — {score_str}")
+                resume_block = "\n".join(lines)
+                context = resume_block + "\n\n" + context if context else resume_block
+                chat_log.info(f"Injected {len(resumes)} resume scores into context")
 
         chat_log.search_strategy("Context Building", f"{len(search_results)} chunks → {context_len} chars")
         doc_types_seen = {}
@@ -119,13 +206,18 @@ class ChatService:
             agent_tag = f" [{p3a}]" if p3a else ""
             chat_log.source_item(i, s["document_title"], s.get("document_type", "") + agent_tag, s["score"])
 
-        # ── Build Q&A system prompt from agent type (NOT extraction prompt) ──
+        # ── Build Q&A system prompt from agent type ──
         agent_counts = {}
         for r in search_results:
             p3a = r.get("phase3_agent") or DOCUMENT_TO_PHASE3_AGENT.get(r.get("document_type", ""), "other_agent")
             agent_counts[p3a] = agent_counts.get(p3a, 0) + 1
         dominant_agent = max(agent_counts, key=agent_counts.get) if agent_counts else "other_agent"
         agent_label = dominant_agent.replace("_", " ").title()
+
+        resume_rank_instruction = (
+            "\n7. The context may include a [Resume Rankings] block with CV evaluation scores. "
+            "Use those scores to rank, compare, or recommend candidates when asked.\n"
+        ) if is_resume_query and any(r.get("cv_score") is not None for r in resumes) else ""
 
         qa_prompt = (
             f"You are the {agent_label} — a document Q&A assistant for Visibility Docs AI.\n\n"
@@ -137,6 +229,7 @@ class ChatService:
             "4. Do NOT make up or hallucinate information.\n"
             "5. Do NOT output JSON or extract fields — just answer the question.\n"
             "6. If the context has tables or diagrams, explain what they show.\n"
+            f"{resume_rank_instruction}"
         )
         chat_log.info(f"Built Q&A prompt for agent: {dominant_agent} ({len(qa_prompt)} chars)")
 

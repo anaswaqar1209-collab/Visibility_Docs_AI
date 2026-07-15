@@ -674,6 +674,42 @@ class RAGService:
         except Exception:
             return None
 
+    def _fetch_doc_cv_scores(self, doc_ids: list[str], org_id: str) -> dict[str, float]:
+        scores = {}
+        if not doc_ids:
+            return scores
+        try:
+            import json
+            unique_ids = list(set(doc_ids))
+            from ..database import _get_supabase, _use_supabase, _local_select_in
+            client = _get_supabase()
+            if _use_supabase and client:
+                r = client.table("document_extractions") \
+                    .select("document_id, extracted_data") \
+                    .in_("document_id", unique_ids) \
+                    .eq("organization_id", org_id) \
+                    .eq("extraction_type", "resume") \
+                    .execute()
+                rows = getattr(r, "data", [])
+            else:
+                rows = _local_select_in("document_extractions",
+                    columns="document_id, extracted_data",
+                    filters={"organization_id": org_id, "extraction_type": "resume"},
+                    in_column="document_id", in_values=unique_ids)
+            for row in rows:
+                raw = row.get("extracted_data", "{}")
+                if isinstance(raw, str):
+                    parsed = json.loads(raw)
+                else:
+                    parsed = raw or {}
+                ev = parsed.get("cv_evaluation") or {}
+                score = ev.get("overall_score")
+                if score is not None:
+                    scores[row["document_id"]] = float(score)
+        except Exception:
+            pass
+        return scores
+
     def _fetch_doc_titles(self, doc_ids: list[str], org_id: str) -> dict:
         titles = {}
         if not doc_ids:
@@ -923,6 +959,12 @@ class RAGService:
             })
         new_count = len(results) - sqs_before
         chat_log.search_result("Supabase Vector", vector_count, new_count)
+
+        # Attach cv_score to resume search results
+        cv_doc_ids = list(set(r["document_id"] for r in results if r.get("document_type") == "resume"))
+        cv_scores = self._fetch_doc_cv_scores(cv_doc_ids, organization_id) if cv_doc_ids else {}
+        for r in results:
+            r["cv_score"] = cv_scores.get(r["document_id"])
 
         results = sorted(results, key=lambda x: x["score"], reverse=True)
         if document_ids:
