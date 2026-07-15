@@ -263,6 +263,21 @@ ATOMIC_PATTERNS = [
     (re.compile(r'^\s*(?:-\s+|\*\s+|\d+[.)]\s+)'), "list_item"),
 ]
 
+INVOICE_HINT_RE = re.compile(
+    r'\b(invoice|inv\.?|bill to|ship to|subtotal|tax|vat|gst|grand total|amount due|due date|payment terms|line item|unit price|purchase order|po number)\b',
+    re.IGNORECASE,
+)
+INVOICE_FIELD_RE = re.compile(
+    r'^\s*[A-Za-z][A-Za-z0-9 /&().,-]{1,40}\s*[:\-]\s*.+$'
+)
+INVOICE_TOTAL_RE = re.compile(
+    r'\b(subtotal|tax|vat|gst|discount|shipping|total|amount due|balance due|paid|due)\b',
+    re.IGNORECASE,
+)
+INVOICE_LINE_ITEM_RE = re.compile(
+    r'^\s*[\w\s().,&/-]{2,80}\s+\d[\d,]*([.]\d+)?\s+\d[\d,]*([.]\d+)?\s+\d[\d,]*([.]\d+)?\s*$'
+)
+
 
 def _is_atomic_start(line: str) -> str | None:
     for pat, atype in ATOMIC_PATTERNS:
@@ -348,6 +363,88 @@ def _parse_atomic_blocks(text: str) -> list[dict]:
             blocks.append({"type": "paragraph", "content": text_content, "words": len(text_content.split())})
 
     return blocks
+
+
+def _looks_like_invoice(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    score = 0
+    for token in (
+        "invoice", "subtotal", "tax", "vat", "gst", "total", "amount due",
+        "due date", "payment terms", "bill to", "ship to", "unit price",
+        "line item", "invoice #", "invoice no", "inv-", "po number",
+    ):
+        if token in lowered:
+            score += 1
+    return score >= 3
+
+
+def _invoice_aware_chunk(text: str, max_words: int = 180) -> list[dict]:
+    if not text:
+        return []
+
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    chunks = []
+    current = []
+    current_words = 0
+    chunk_index = 0
+
+    def flush_current():
+        nonlocal current, current_words, chunk_index
+        content = "\n".join(current).strip()
+        if not content:
+            current = []
+            current_words = 0
+            return
+        chunks.append({
+            "content": content,
+            "chunk_id": hashlib.md5(content.encode()).hexdigest(),
+            "chunk_index": chunk_index,
+            "word_count": len(content.split()),
+            "chunk_type": "invoice_section",
+        })
+        chunk_index += 1
+        current = []
+        current_words = 0
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            flush_current()
+            continue
+
+        is_field = bool(INVOICE_FIELD_RE.match(line) and (":" in line or "-" in line)) and len(line) < 140
+        is_total = bool(INVOICE_TOTAL_RE.search(line))
+        is_item = bool(INVOICE_LINE_ITEM_RE.match(line))
+        words = len(line.split())
+
+        if is_field or is_total:
+            flush_current()
+            chunks.append({
+                "content": line,
+                "chunk_id": hashlib.md5(line.encode()).hexdigest(),
+                "chunk_index": chunk_index,
+                "word_count": words,
+                "chunk_type": "invoice_field" if is_field else "invoice_total",
+            })
+            chunk_index += 1
+            continue
+
+        if is_item:
+            if current and current_words + words > max_words:
+                flush_current()
+            current.append(line)
+            current_words += words
+            continue
+
+        if current_words + words > max_words and current:
+            flush_current()
+        current.append(line)
+        current_words += words
+
+    flush_current()
+    return chunks
 
 
 def _markdown_aware_chunk(text: str, max_words: int = 250) -> list[dict]:
@@ -459,6 +556,238 @@ class RAGService:
             print(f"[SEARCH] Query expansion failed: {e}")
         return []
 
+    def _expand_finance_query(self, query: str) -> list[str]:
+        """Deterministic finance/invoice query expansion for better keyword recall."""
+        if not query:
+            return []
+        q = query.lower()
+        variants = set()
+
+        def add_variant(text: str):
+            clean = " ".join(text.split()).strip()
+            if clean and clean != query:
+                variants.add(clean)
+
+        synonym_map = [
+            (("invoice number", "invoice no", "inv no", "inv #"), ["invoice #", "invoice number", "inv no"]),
+            (("due date", "payment due", "pay by", "deadline"), ["due date", "payment due date", "pay by date"]),
+            (("total", "amount due", "grand total", "final amount"), ["total amount", "amount due", "grand total"]),
+            (("subtotal", "sub total"), ["subtotal", "sub total"]),
+            (("tax", "vat", "gst"), ["tax amount", "vat amount", "gst amount"]),
+            (("vendor", "supplier", "seller"), ["vendor name", "supplier name", "seller name"]),
+            (("customer", "buyer", "bill to"), ["customer name", "bill to"]),
+            (("line item", "items", "item list"), ["line items", "items", "item list"]),
+            (("کل رقم", "رقم", "ٹوٹل"), ["total amount", "کل رقم", "grand total"]),
+            (("انوائس", "بل", "رسید"), ["invoice", "bill", "invoice number"]),
+            (("تاریخ", "due date"), ["due date", "تاریخ وصولی", "payment due date"]),
+            (("vendor", "فروشندہ", "سپلائر"), ["vendor name", "فروشندہ کا نام", "supplier name"]),
+            (("customer", "گاہک", "خریدار"), ["customer name", "گاہک کا نام", "bill to"]),
+            (("total amount", "کل رقم", "مجموعی رقم"), ["total amount", "کل رقم", "grand total", "amount due"]),
+        ]
+
+        for needles, replacements in synonym_map:
+            if any(n in q for n in needles):
+                for repl in replacements:
+                    add_variant(query.replace(next((n for n in needles if n in q), needles[0]), repl))
+                add_variant(f"{query} invoice")
+                add_variant(f"{query} amount")
+
+        if "invoice" in q or "bill" in q or "amount" in q:
+            add_variant(f"invoice total {query}")
+            add_variant(f"invoice number due date total {query}")
+
+        return list(variants)[:4]
+
+    def _build_structured_summary_text(self, document_ids: list[str], organization_id: str) -> str:
+        if not document_ids:
+            return ""
+        try:
+            import json
+            from ..database import _get_supabase, _use_supabase, _local_select_in
+            unique_ids = list(set(document_ids))
+            client = _get_supabase()
+            if _use_supabase and client:
+                r = client.table("documents_metadata") \
+                    .select("document_id, document_type, extracted_data, field_confidence, overall_confidence") \
+                    .in_("document_id", unique_ids) \
+                    .eq("organization_id", organization_id) \
+                    .execute()
+                rows = getattr(r, "data", [])
+            else:
+                rows = _local_select_in(
+                    "documents_metadata",
+                    columns="document_id, document_type, extracted_data, field_confidence, overall_confidence",
+                    filters={"organization_id": organization_id},
+                    in_column="document_id",
+                    in_values=unique_ids,
+                )
+            if not rows:
+                return ""
+
+            doc_titles = self._fetch_doc_titles(unique_ids, organization_id)
+            parts = ["[Structured Document Summary]"]
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("extracted_data", "{}")
+                if isinstance(raw, str):
+                    try:
+                        extracted = json.loads(raw)
+                    except Exception:
+                        extracted = {}
+                else:
+                    extracted = raw or {}
+                if not isinstance(extracted, dict) or not extracted:
+                    continue
+
+                did = row.get("document_id", "")
+                title, dtype, p3a = doc_titles.get(did, ("", "", ""))
+                label = title or did or "Document"
+                parts.append(f"\nDocument: {label}")
+                if dtype:
+                    parts.append(f"Type: {dtype}")
+                if p3a:
+                    parts.append(f"Agent: {p3a}")
+
+                # Finance docs benefit from compact, field-exact summaries.
+                for key, value in extracted.items():
+                    if key.startswith("_"):
+                        continue
+                    if value in (None, "", [], {}):
+                        continue
+                    if isinstance(value, (str, int, float, bool)):
+                        parts.append(f"{key}: {value}")
+                    elif isinstance(value, list):
+                        if key == "line_items":
+                            parts.append("line_items:")
+                            for item in value[:20]:
+                                if isinstance(item, dict):
+                                    item_bits = []
+                                    for field in ("description", "quantity", "unit_price", "price", "total", "amount"):
+                                        if item.get(field) not in (None, "", []):
+                                            item_bits.append(f"{field}={item.get(field)}")
+                                    if item_bits:
+                                        parts.append("  - " + ", ".join(item_bits))
+                                else:
+                                    parts.append(f"  - {item}")
+                        else:
+                            parts.append(f"{key}: {value[:10]}")
+                    elif isinstance(value, dict):
+                        nested_bits = []
+                        for nested_key, nested_val in value.items():
+                            if nested_val not in (None, "", [], {}):
+                                nested_bits.append(f"{nested_key}={nested_val}")
+                        if nested_bits:
+                            parts.append(f"{key}: " + ", ".join(nested_bits[:20]))
+
+            summary = "\n".join(parts).strip()
+            return summary if len(summary) > len("[Structured Document Summary]") else ""
+        except Exception:
+            return ""
+
+    def index_structured_summary(self, document_id: str, organization_id: str, document_type: str,
+                                 extracted_data: dict, field_confidence: dict | None = None):
+        if not extracted_data or not isinstance(extracted_data, dict):
+            return
+        try:
+            import json
+            title_map = self._fetch_doc_titles([document_id], organization_id)
+            title, dtype, p3a = title_map.get(document_id, ("", document_type or "", ""))
+            summary_lines = ["Structured Document Summary"]
+            if title:
+                summary_lines.append(f"Title: {title}")
+            if dtype:
+                summary_lines.append(f"Type: {dtype}")
+            if p3a:
+                summary_lines.append(f"Agent: {p3a}")
+            for key, value in extracted_data.items():
+                if key.startswith("_"):
+                    continue
+                if value in (None, "", [], {}):
+                    continue
+                if isinstance(value, (str, int, float, bool)):
+                    summary_lines.append(f"{key}: {value}")
+                elif isinstance(value, list):
+                    if key == "line_items":
+                        summary_lines.append("line_items:")
+                        for item in value[:25]:
+                            if isinstance(item, dict):
+                                parts = []
+                                for field in ("description", "quantity", "unit_price", "price", "total", "amount"):
+                                    if item.get(field) not in (None, "", []):
+                                        parts.append(f"{field}={item.get(field)}")
+                                if parts:
+                                    summary_lines.append("  - " + ", ".join(parts))
+                            else:
+                                summary_lines.append(f"  - {item}")
+                    else:
+                        summary_lines.append(f"{key}: {json.dumps(value[:10], ensure_ascii=False)}")
+                elif isinstance(value, dict):
+                    nested = ", ".join(f"{k}={v}" for k, v in value.items() if v not in (None, "", [], {}))
+                    if nested:
+                        summary_lines.append(f"{key}: {nested}")
+
+            if field_confidence:
+                conf_bits = []
+                for key, value in field_confidence.items():
+                    if isinstance(value, (int, float)):
+                        conf_bits.append(f"{key}={value:.2f}")
+                if conf_bits:
+                    summary_lines.append("field_confidence: " + ", ".join(conf_bits[:25]))
+
+            summary_text = "\n".join(summary_lines).strip()
+            if len(summary_text.split()) < 5:
+                return
+
+            heading = "Structured Invoice Summary" if document_type == "invoice" else "Structured Document Summary"
+            chunk = {
+                "content": summary_text,
+                "chunk_id": hashlib.md5(summary_text.encode()).hexdigest(),
+                "chunk_index": 0,
+                "word_count": len(summary_text.split()),
+                "heading": heading,
+                "chunk_type": "structured_summary",
+            }
+            embedding = embedding_service.embed_text(summary_text)
+            chunk_rec = {
+                "organization_id": organization_id,
+                "document_id": document_id,
+                "page_id": None,
+                "chunk_index": 0,
+                "chunk_type": "structured_summary",
+                "heading": heading,
+                "content": summary_text,
+                "chunk_text": summary_text,
+                "metadata": {
+                    "chunk_index": 0,
+                    "word_count": len(summary_text.split()),
+                    "heading": heading,
+                    "document_type": document_type,
+                    "source": "structured_summary",
+                },
+            }
+            emb_rec = {
+                "organization_id": organization_id,
+                "document_id": document_id,
+                "embedding": embedding,
+                "model_name": "all-MiniLM-L6-v2",
+            }
+            SupabaseDB.insert("document_chunks", chunk_rec)
+            SupabaseDB.insert("document_embeddings", emb_rec)
+            if pinecone_service.available:
+                vid = f"{document_id}_{chunk['chunk_id']}"
+                pinecone_service.upsert([(vid, embedding, {
+                    "document_id": document_id,
+                    "organization_id": organization_id,
+                    "chunk_index": 0,
+                    "chunk_type": "structured_summary",
+                    "chunk_text": summary_text[:1000],
+                    "heading": heading,
+                    "document_type": document_type,
+                })], namespace=organization_id)
+        except Exception as e:
+            print(f"[INDEX] Structured summary indexing failed: {e}")
+
     def _rrf_fuse(self, per_strategy: list[list[dict]], k: int = 60) -> list[dict]:
         """Reciprocal Rank Fusion — fair scoring across heterogeneous search strategies."""
         rrf_map = {}
@@ -512,7 +841,9 @@ class RAGService:
                         parts = []
                         if prev_content:
                             parts.append(f"[Previous section]: {prev_content[:800]}")
-                        parts.append(c["chunk_text"] if ci == c.get("chunk_index") else chunk_map.get(ci, c.get("chunk_text", "")))
+                        current_content = chunk_map.get(ci, "")
+                        if current_content:
+                            parts.append(current_content[:1200])
                         if next_content:
                             parts.append(f"[Next section]: {next_content[:800]}")
                         neighbor_texts[did + "::" + str(ci)].append("\n\n".join(parts))
@@ -529,6 +860,11 @@ class RAGService:
     def chunk_text(self, text: str, max_words: int = 250) -> list[dict]:
         if not text:
             return []
+
+        if _looks_like_invoice(text):
+            invoice_chunks = _invoice_aware_chunk(text, max_words=max(120, min(max_words, 180)))
+            if invoice_chunks:
+                return invoice_chunks
 
         chunks = _markdown_aware_chunk(text, max_words)
         if chunks:
@@ -859,6 +1195,16 @@ class RAGService:
 
         # ── Query expansion: generate alternative phrasings for better recall ──
         alt_queries = self._expand_query(query)
+        alt_queries.extend(self._expand_finance_query(query))
+        # Preserve order while dropping duplicates
+        deduped_alt = []
+        seen_alt = set()
+        for aq in alt_queries:
+            key = aq.strip().lower()
+            if key and key not in seen_alt:
+                seen_alt.add(key)
+                deduped_alt.append(aq)
+        alt_queries = deduped_alt[:4]
         alt_embeddings = []
         for aq in alt_queries:
             ae = embedding_service.embed_query(aq)

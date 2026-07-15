@@ -17,6 +17,13 @@ SYSTEM_PROMPT = (
     "If the answer is not in the context, say 'I cannot find this information in the document.'"
 )
 
+AGENT_SYSTEM_PROMPT = (
+    "You are a helpful document analysis assistant. "
+    "Follow the Agent Instructions carefully. "
+    "Answer in the same language as the user's question. "
+    "Be thorough and extract all relevant information from the context."
+)
+
 
 def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
     if session_id not in _store:
@@ -54,7 +61,7 @@ class ConversationService:
             ])
         else:
             prompt = ChatPromptTemplate.from_messages([
-                ("system", SYSTEM_PROMPT),
+                ("system", AGENT_SYSTEM_PROMPT),
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "Agent Instructions:\n{agent_instructions}\n\nDocument Context:\n{context}\n\nQuestion: {question}"),
             ])

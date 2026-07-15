@@ -172,6 +172,15 @@ class ChatService:
         is_resume_query = any(
             __import__("re").search(kw, q_lower) for kw in _RESUME_KEYWORDS
         )
+        is_finance_query = (
+            document_type == "invoice"
+            or phase3_agent == "finance_agent"
+            or any(term in q_lower for term in [
+                "invoice", "subtotal", "amount due", "grand total", "due date",
+                "payment terms", "vendor", "customer", "bill to", "ship to",
+                "tax", "vat", "gst", "line item", "line items", "invoice number",
+            ])
+        )
 
         if not search_results and not is_resume_query and document_type:
             chat_log.warn(f"No results with document_type={document_type} — retrying without type filter")
@@ -206,6 +215,34 @@ class ChatService:
                         "score": r.get("cv_score", 0) / 100.0,
                     })
                 resume_context = "\n".join(lines)
+
+            # If search returned nothing but we are clearly in finance/invoice mode,
+            # answer directly from structured extraction data when available.
+            finance_context = ""
+            if is_finance_query and resolved_ids:
+                finance_context = self._fetch_extraction_summary(resolved_ids, organization_id)
+            if finance_context:
+                chat_log.search_strategy("Structured Extraction Fallback", "no vector matches, using invoice metadata")
+                finance_prompt = (
+                    "You are a Finance Agent for Visibility Docs AI.\n\n"
+                    "Use the provided structured extraction summary to answer the question exactly.\n"
+                    "If the answer is missing, say you cannot find it in the documents.\n"
+                    "Do not invent numbers, dates, or names.\n"
+                )
+                chat_log.llm_call("llama-3.3-70b-versatile", len(finance_context), len(question), 1)
+                llm_t0 = time.time()
+                answer = conversation_service.chat(question, finance_context, session_id=sid, system_prompt=finance_prompt)
+                chat_log.llm_response(time.time() - llm_t0, len(answer))
+                self._save_exchange(sid, question, answer, [], is_first)
+                total = time.time() - t_start
+                chat_log.chat_end(total, 0)
+                return {
+                    "answer": answer,
+                    "sources": [],
+                    "document_id": resolved_ids[0] if resolved_ids else "",
+                    "history": conversation_service.get_history(sid),
+                    "session_id": sid,
+                }
 
             chat_log.search_strategy("Context Building", "no results found")
             chat_log.warn("No relevant documents found in search")
@@ -292,7 +329,7 @@ class ChatService:
         is_aggregate_query = any(
             __import__("re").search(kw, q_lower) for kw in _AGGREGATE_KEYWORDS
         )
-        if is_aggregate_query and resolved_ids:
+        if (is_aggregate_query or is_finance_query) and resolved_ids:
             extraction_summary = self._fetch_extraction_summary(resolved_ids, organization_id)
             if extraction_summary:
                 context = extraction_summary + "\n\n" + context if context else extraction_summary
@@ -351,55 +388,84 @@ class ChatService:
         # Load the full agent .md prompt and adapt it for Q&A
         qa_prompt = ""
         try:
-            raw_prompt = _load_phase3_prompt(f"{dominant_agent}.md")
-            if raw_prompt:
-                import re
-                qa_prompt = raw_prompt.replace("{text}", "{context}")
-                # Remove extraction-specific JSON instructions, keep Document text line
-                qa_prompt = re.sub(
-                    r"Return ONLY valid JSON\..*?(?=\nDocument text:)",
-                    "Answer the user's question based ONLY on the provided document context below.",
-                    qa_prompt,
-                    flags=re.DOTALL,
+            if is_finance_query or dominant_agent == "finance_agent":
+                qa_prompt = (
+                    "You are the Finance Agent for Visibility Docs AI, answering questions about invoices and other financial documents.\n\n"
+                    "Use ONLY the provided context. Prefer the structured extraction summary when it exists, because it contains exact extracted fields.\n\n"
+                    "Rules:\n"
+                    "0. Always answer in the same language as the user's question — Urdu/Saraiki question → Urdu answer, English question → English answer.\n"
+                    "1. Answer directly and precisely.\n"
+                    "2. For invoice questions, use exact values for invoice number, dates, vendor, customer, subtotal, tax, total, due date, payment terms, and line items.\n"
+                    "3. Keep currency symbols and units intact.\n"
+                    "4. If the answer is not present, say \"I cannot find this information in the documents.\"\n"
+                    "5. If there is a mismatch between structured data and raw text, mention it briefly.\n"
+                    "6. Do not invent values.\n"
+                    "7. If line items are present, list them cleanly and include quantities/prices when available.\n"
+                    "8. Do not output JSON.\n"
                 )
-                # Remove the now-unnecessary "Document text:" line
-                qa_prompt = qa_prompt.replace("\nDocument text:\n{context}", "")
-                qa_prompt += (
-                    "\n\nRules:\n"
-                    "1. Answer concisely and directly using the context.\n"
-                    "2. If the context contains image/vision descriptions, use them to answer.\n"
-                    "3. If the answer is NOT in the context, say \"I cannot find this information in the documents.\"\n"
-                    "4. Do NOT make up or hallucinate information.\n"
-                    "5. Do NOT output JSON or extract fields — just answer the question naturally.\n"
-                    "6. If the context has tables or diagrams, explain what they show.\n"
-                )
-                resume_rank_instruction = (
-                    "\n7. The context may include a [Resume Rankings] block with CV evaluation scores. "
-                    "Use those scores to rank, compare, or recommend candidates when asked.\n"
-                ) if is_resume_query and any(r.get("cv_score") is not None for r in resumes) else ""
-                qa_prompt += resume_rank_instruction
+            else:
+                raw_prompt = _load_phase3_prompt(f"{dominant_agent}.md")
+                if raw_prompt:
+                    import re
+                    qa_prompt = raw_prompt.replace("{text}", "{context}")
+                    # Remove extraction-specific JSON instructions, keep Document text line
+                    qa_prompt = re.sub(
+                        r"Return ONLY valid JSON\..*?(?=\nDocument text:)",
+                        "Answer the user's question based ONLY on the provided document context below.",
+                        qa_prompt,
+                        flags=re.DOTALL,
+                    )
+                    # Remove the now-unnecessary "Document text:" line
+                    qa_prompt = qa_prompt.replace("\nDocument text:\n{context}", "")
+                    qa_prompt += (
+                        "\n\nRules:\n"
+                        "0. Always answer in the same language as the user's question — Urdu/Saraiki question → Urdu answer, English question → English answer.\n"
+                        "1. Answer concisely and directly using the context.\n"
+                        "2. If the context contains image/vision descriptions, use them to answer.\n"
+                        "3. If the answer is NOT in the context, say \"I cannot find this information in the documents.\"\n"
+                        "4. Do NOT make up or hallucinate information.\n"
+                        "5. Do NOT output JSON or extract fields — just answer the question naturally.\n"
+                        "6. If the context has tables or diagrams, explain what they show.\n"
+                    )
+                    resume_rank_instruction = (
+                        "\n7. The context may include a [Resume Rankings] block with CV evaluation scores. "
+                        "Use those scores to rank, compare, or recommend candidates when asked.\n"
+                    ) if is_resume_query and any(r.get("cv_score") is not None for r in resumes) else ""
+                    qa_prompt += resume_rank_instruction
         except Exception:
             pass
 
         if not qa_prompt:
             # Fallback: generic prompt with agent label
             agent_label = dominant_agent.replace("_", " ").title()
-            resume_rank_instruction = (
-                "\n7. The context may include a [Resume Rankings] block with CV evaluation scores. "
-                "Use those scores to rank, compare, or recommend candidates when asked.\n"
-            ) if is_resume_query and any(r.get("cv_score") is not None for r in resumes) else ""
-            qa_prompt = (
-                f"You are the {agent_label} — a document Q&A assistant for Visibility Docs AI.\n\n"
-                "Your job is to answer the user's question based ONLY on the provided document context below.\n\n"
-                "Rules:\n"
-                "1. Answer concisely and directly using the context.\n"
-                "2. If the context contains image/vision descriptions, use them to answer.\n"
-                "3. If the answer is NOT in the context, say \"I cannot find this information in the documents.\"\n"
-                "4. Do NOT make up or hallucinate information.\n"
-                "5. Do NOT output JSON or extract fields — just answer the question.\n"
-                "6. If the context has tables or diagrams, explain what they show.\n"
-                f"{resume_rank_instruction}"
-            )
+            if is_finance_query or dominant_agent == "finance_agent":
+                qa_prompt = (
+                    "You are a Finance Agent for Visibility Docs AI.\n\n"
+                    "Answer only from the provided context and structured summary.\n\n"
+                    "Rules:\n"
+                    "1. Be exact about amounts, dates, and names.\n"
+                    "2. Keep currency symbols and percentages intact.\n"
+                    "3. If the answer is missing, say you cannot find it in the documents.\n"
+                    "4. Do not hallucinate or infer unsupported numbers.\n"
+                    "5. Do not output JSON.\n"
+                )
+            else:
+                resume_rank_instruction = (
+                    "\n7. The context may include a [Resume Rankings] block with CV evaluation scores. "
+                    "Use those scores to rank, compare, or recommend candidates when asked.\n"
+                ) if is_resume_query and any(r.get("cv_score") is not None for r in resumes) else ""
+                qa_prompt = (
+                    f"You are the {agent_label} - a document Q&A assistant for Visibility Docs AI.\n\n"
+                    "Your job is to answer the user's question based ONLY on the provided document context below.\n\n"
+                    "Rules:\n"
+                    "1. Answer concisely and directly using the context.\n"
+                    "2. If the context contains image/vision descriptions, use them to answer.\n"
+                    "3. If the answer is NOT in the context, say \"I cannot find this information in the documents.\"\n"
+                    "4. Do NOT make up or hallucinate information.\n"
+                    "5. Do NOT output JSON or extract fields - just answer the question.\n"
+                    "6. If the context has tables or diagrams, explain what they show.\n"
+                    f"{resume_rank_instruction}"
+                )
         chat_log.info(f"Built Q&A prompt for agent: {dominant_agent} ({len(qa_prompt)} chars)")
 
         chat_log.llm_call("llama-3.3-70b-versatile", context_len, len(question), len(sources))
