@@ -322,13 +322,33 @@ class ChatService:
             agent_tag = f" [{p3a}]" if p3a else ""
             chat_log.source_item(i, s["document_title"], s.get("document_type", "") + agent_tag, s["score"])
 
-        # ── Build Q&A system prompt from agent type ──
+        # ── Determine dominant agent from selected documents directly ──
+        doc_agent_counts = {}
+        if resolved_ids:
+            try:
+                doc_result = SupabaseDB.select("documents",
+                    columns="id, document_type, phase3_agent",
+                    filters={"organization_id": organization_id},
+                )
+                doc_data = getattr(doc_result, "data", doc_result if isinstance(doc_result, list) else [])
+                resolved_set = set(resolved_ids)
+                for d in doc_data:
+                    if d.get("id") in resolved_set:
+                        p3a = d.get("phase3_agent") or DOCUMENT_TO_PHASE3_AGENT.get(d.get("document_type", ""), "other_agent")
+                        if p3a:
+                            doc_agent_counts[p3a] = doc_agent_counts.get(p3a, 0) + 1
+            except Exception:
+                pass
+
+        # Also count from search results as fallback
         agent_counts = {}
         for r in search_results:
             p3a = r.get("phase3_agent") or DOCUMENT_TO_PHASE3_AGENT.get(r.get("document_type", ""), "other_agent")
             agent_counts[p3a] = agent_counts.get(p3a, 0) + 1
-        dominant_agent = max(agent_counts, key=agent_counts.get) if agent_counts else "other_agent"
-        agent_label = dominant_agent.replace("_", " ").title()
+
+        # Use selected-doc agents if available, otherwise fall back to search result agents
+        dominant_source = doc_agent_counts if doc_agent_counts else agent_counts
+        dominant_agent = max(dominant_source, key=dominant_source.get) if dominant_source else "other_agent"
 
         # Load the full agent .md prompt and adapt it for Q&A
         qa_prompt = ""
