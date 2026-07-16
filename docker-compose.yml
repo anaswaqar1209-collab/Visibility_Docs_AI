@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  ai-backend:
+    build:
+      context: ./ai-backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai-backend/uploads:/app/uploads
+      - ./ai-backend/processed:/app/processed
+    env_file:
+      - ./ai-backend/.env
+    environment:
+      - USE_GPU=false
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "5100:5100"
+    environment:
+      - PORT=5100
+      - MONGO_URI=mongodb://host.docker.internal:27017/visibility_docs_ai
+      - FRONTEND_URL=http://localhost:3124
+      - AI_SERVICE_URL=http://ai-backend:8000
+      - AI_SERVICE_ENABLED=true
+    depends_on:
+      - ai-backend
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3124:3124"
+    environment:
+      - PORT=3124
+      - NEXT_PUBLIC_API_URL=http://localhost:5100/api
+    depends_on:
+      - api-gateway
+    restart: unless-stopped
