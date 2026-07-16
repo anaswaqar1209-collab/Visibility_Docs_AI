@@ -33,9 +33,15 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     organization_id TEXT NOT NULL,
     document_id TEXT NOT NULL,
     page_id TEXT,
+    chunk_index INTEGER DEFAULT 0,
     chunk_type TEXT DEFAULT 'paragraph',
     heading TEXT,
+    section TEXT,
+    section_number TEXT,
+    machine_id TEXT,
+    filename TEXT,
     content TEXT NOT NULL,
+    chunk_text TEXT,
     metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT now()
 );

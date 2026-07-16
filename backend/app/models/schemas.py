@@ -97,6 +97,11 @@ class SearchResult(BaseModel):
     cv_score: Optional[float] = None
     chunk_text: str
     page_number: Optional[int] = None
+    heading: Optional[str] = None
+    section: Optional[str] = None
+    section_number: Optional[str] = None
+    machine_id: Optional[str] = None
+    filename: Optional[str] = None
     score: float
     metadata: Optional[dict] = None
 

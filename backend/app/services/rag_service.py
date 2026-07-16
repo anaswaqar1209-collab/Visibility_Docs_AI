@@ -927,7 +927,8 @@ class RAGService:
 
         return chunks
 
-    def index_document(self, document_id: str, organization_id: str, text: str, file_path: str = None, page_number: int = None):
+    def index_document(self, document_id: str, organization_id: str, text: str, file_path: str = None,
+                       page_number: int = None, document_type: str = None, machine_id: str = None, filename: str = None):
         print(f"\n[INDEX] Indexing document {document_id[:12] if document_id else '?'}... ({len(text)} chars)")
 
         headings = []
@@ -959,22 +960,45 @@ class RAGService:
             return
         print(f"[INDEX] Generated {len(chunks)} chunks")
 
+        # Build enriched chunk metadata for embedding + storage
+        import re as _re
+        chunk_metadata = []
+        for c in chunks:
+            heading = c.get("heading", "")
+            sec_num = ""
+            if heading:
+                m = _re.match(r'^(\d+(?:\.\d+)*)', heading.strip())
+                if m:
+                    sec_num = m.group(1)
+            chunk_metadata.append({
+                "heading": heading,
+                "page_number": page_number,
+                "document_type": document_type,
+                "section": c.get("chunk_type", ""),
+                "section_number": sec_num,
+                "machine_id": machine_id,
+                "filename": filename or (file_path.split("\\")[-1] if file_path else ""),
+            })
+
         embeddings = embedding_service.embed_chunks(
             [c["content"] for c in chunks],
             document_id=document_id,
             organization_id=organization_id,
+            chunk_metadata=chunk_metadata,
         )
         print(f"[INDEX] Got {len(embeddings)} embeddings")
 
         try:
             chunk_records = []
             emb_records = []
-            for chunk, embedding in zip(chunks, embeddings):
+            for chunk, embedding, cm in zip(chunks, embeddings, chunk_metadata):
                 heading = chunk.get("heading")
                 ctype = chunk.get("chunk_type", "paragraph")
                 meta = {"chunk_index": chunk.get("chunk_index", 0), "word_count": chunk.get("word_count", 0)}
                 if heading:
                     meta["heading"] = heading
+                section = cm.get("section", "")
+                section_number = cm.get("section_number", "")
                 chunk_records.append({
                     "organization_id": organization_id,
                     "document_id": document_id,
@@ -982,6 +1006,10 @@ class RAGService:
                     "chunk_index": chunk.get("chunk_index", 0),
                     "chunk_type": ctype,
                     "heading": heading,
+                    "section": section,
+                    "section_number": section_number,
+                    "machine_id": machine_id,
+                    "filename": cm.get("filename", ""),
                     "content": chunk["content"],
                     "chunk_text": chunk["content"],
                     "metadata": meta,
@@ -1262,6 +1290,11 @@ class RAGService:
                         "phase3_agent": p3a,
                         "chunk_text": meta.get("chunk_text", "")[:3000],
                         "page_number": meta.get("page_number"),
+                        "heading": meta.get("heading"),
+                        "section": meta.get("section"),
+                        "section_number": meta.get("section_number"),
+                        "machine_id": meta.get("machine_id"),
+                        "filename": meta.get("filename"),
                         "chunk_index": ci,
                         "score": r.get("score", 0),
                         "metadata": meta,
@@ -1298,6 +1331,11 @@ class RAGService:
                         "phase3_agent": p3a,
                         "chunk_text": item.get("content", "")[:3000],
                         "page_number": item.get("page_id"),
+                        "heading": item.get("heading"),
+                        "section": item.get("section"),
+                        "section_number": item.get("section_number"),
+                        "machine_id": item.get("machine_id"),
+                        "filename": item.get("filename"),
                         "chunk_index": item.get("chunk_index"),
                         "score": 0.9,
                         "metadata": item.get("metadata"),
@@ -1355,6 +1393,11 @@ class RAGService:
                             "phase3_agent": p3a,
                             "chunk_text": item.get("content", "")[:3000],
                             "page_number": item.get("page_id"),
+                            "heading": item.get("heading"),
+                            "section": item.get("section"),
+                            "section_number": item.get("section_number"),
+                            "machine_id": item.get("machine_id"),
+                            "filename": item.get("filename"),
                             "chunk_index": item.get("chunk_index"),
                             "score": 0.7,
                             "metadata": item.get("metadata"),
@@ -1396,6 +1439,11 @@ class RAGService:
                 "phase3_agent": p3a,
                 "chunk_text": chunk.get("content", chunk.get("chunk_text", "")),
                 "page_number": chunk.get("page_number", chunk.get("page_id")),
+                "heading": chunk.get("heading"),
+                "section": chunk.get("section"),
+                "section_number": chunk.get("section_number"),
+                "machine_id": chunk.get("machine_id"),
+                "filename": chunk.get("filename"),
                 "chunk_index": chunk.get("chunk_index"),
                 "score": chunk.get("similarity", chunk.get("score", 0)),
                 "metadata": chunk.get("metadata"),

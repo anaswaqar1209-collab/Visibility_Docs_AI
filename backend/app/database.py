@@ -68,6 +68,10 @@ def _init_local_db(conn):
             chunk_index INTEGER DEFAULT 0,
             chunk_type TEXT DEFAULT 'paragraph',
             heading TEXT,
+            section TEXT,
+            section_number TEXT,
+            machine_id TEXT,
+            filename TEXT,
             content TEXT NOT NULL,
             chunk_text TEXT,
             metadata TEXT,
@@ -221,6 +225,11 @@ def _init_local_db(conn):
         conn.execute("ALTER TABLE documents ADD COLUMN phase3_agent TEXT")
     except Exception:
         pass
+    for col in ("section", "section_number", "machine_id", "filename"):
+        try:
+            conn.execute(f"ALTER TABLE document_chunks ADD COLUMN {col} TEXT")
+        except Exception:
+            pass
 
 
 class SupabaseDB:
@@ -561,9 +570,10 @@ def _local_insert(table: str, data: dict):
         conn.commit()
         return type("Result", (), {"data": [dict(conn.execute("SELECT * FROM documents WHERE id=?", (data["id"],)).fetchone())]})()
     if table == "document_chunks":
-        cur = conn.execute("INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, content, chunk_text, metadata) VALUES (?,?,?,?,?,?,?,?)",
+        cur = conn.execute("INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, section, section_number, machine_id, filename, content, chunk_text, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                            (data.get("organization_id", ""), data.get("document_id", ""), data.get("page_id"), data.get("chunk_type", "paragraph"),
-                            data.get("heading"), data.get("content", ""), data.get("chunk_text") or data.get("content", ""),
+                            data.get("heading"), data.get("section"), data.get("section_number"), data.get("machine_id"), data.get("filename"),
+                            data.get("content", ""), data.get("chunk_text") or data.get("content", ""),
                             __import__("json").dumps(data.get("metadata")) if data.get("metadata") else None))
         conn.commit()
         chunk_id = cur.lastrowid
@@ -666,9 +676,10 @@ def _local_batch_insert(table: str, records: list[dict]):
     if table == "document_chunks":
         doc_ids = set()
         conn.executemany(
-            "INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, content, chunk_text, chunk_index, metadata) VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, section, section_number, machine_id, filename, content, chunk_text, chunk_index, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(r.get("organization_id", ""), r.get("document_id", ""), r.get("page_id"),
               r.get("chunk_type", "paragraph"), r.get("heading"),
+              r.get("section"), r.get("section_number"), r.get("machine_id"), r.get("filename"),
               r.get("content", ""), r.get("chunk_text") or r.get("content", ""),
               r.get("chunk_index", 0), __import__("json").dumps(r.get("metadata")) if r.get("metadata") else None) for r in records])
         for r in records:
@@ -715,11 +726,19 @@ def _local_fts_sync(document_id: str = None):
             rows = conn.execute("SELECT id, content, chunk_text, document_id, organization_id, page_id FROM document_chunks").fetchall()
         for r in rows:
             try:
-                fts_content = r["content"]
-                if r.get("chunk_text"):
-                    fts_content = r["chunk_text"]
+                row = dict(r)
+                fts_parts = []
+                if row.get("content"):
+                    fts_parts.append(str(row["content"]))
+                if row.get("chunk_text") and row.get("chunk_text") != row.get("content"):
+                    fts_parts.append(str(row["chunk_text"]))
+                # Include heading text so label-based invoice queries can match.
+                heading = row.get("heading")
+                if heading:
+                    fts_parts.insert(0, str(heading))
+                fts_content = "\n".join(fts_parts) if fts_parts else ""
                 conn.execute("INSERT INTO chunks_fts (rowid, content, document_id, organization_id, page_id) VALUES (?, ?, ?, ?, ?)",
-                             (r["id"], fts_content, r["document_id"], r["organization_id"], r["page_id"]))
+                             (row["id"], fts_content, row["document_id"], row["organization_id"], row["page_id"]))
             except Exception:
                 pass
         conn.commit()
@@ -765,6 +784,7 @@ def _local_search_vector(query_vector: list, match_threshold: float = 0.7, match
             return type("Result", (), {"data": []})()
         scores = []
         for row in rows:
+            row = dict(row)
             raw = row["embedding"]
             try:
                 stored = list(raw)
@@ -776,9 +796,8 @@ def _local_search_vector(query_vector: list, match_threshold: float = 0.7, match
             if score >= match_threshold:
                 if filter_org_id and row.get("organization_id") != filter_org_id:
                     continue
-                r = dict(row)
-                r.pop("embedding", None)
-                scores.append((score, r))
+                row.pop("embedding", None)
+                scores.append((score, row))
         scores.sort(key=lambda x: x[0], reverse=True)
         for score, row in scores[:match_count]:
             result_data.append({**row, "similarity": score})

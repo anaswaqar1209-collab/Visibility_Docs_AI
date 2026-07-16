@@ -348,7 +348,10 @@ class OrchestratorService:
                 log.info("Running in parallel with embedding...")
 
                 ext_future = pool.submit(category_agents.extract, raw_text, doc_type, effective_agent)
-                emb_future = pool.submit(rag_service.index_document, document_id, organization_id, raw_text, file_path)
+                import os as _os
+                _filename = _os.path.basename(file_path) if file_path else ""
+                emb_future = pool.submit(rag_service.index_document, document_id, organization_id, raw_text, file_path,
+                                         document_type=doc_type, filename=_filename)
 
                 t0 = time.time()
                 extraction = ext_future.result(timeout=120)  # 2 min timeout
@@ -388,6 +391,16 @@ class OrchestratorService:
                 "extracted_data": extraction.get("extracted_data", {}),
                 "confidence": extraction.get("confidence", 0),
             })
+            try:
+                rag_service.index_structured_summary(
+                    document_id=document_id,
+                    organization_id=organization_id,
+                    document_type=doc_type,
+                    extracted_data=extraction.get("extracted_data", {}),
+                    field_confidence=extraction.get("field_confidence", {}),
+                )
+            except Exception as e:
+                log.warn(f"Structured summary indexing skipped: {e}")
             self.update_stage(document_id, organization_id, "extracted", 80)
             self.update_stage(document_id, organization_id, "embedded", 95)
 
