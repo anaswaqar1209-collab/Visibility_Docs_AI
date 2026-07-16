@@ -773,7 +773,13 @@ def _local_keyword_search(query: str, organization_id: str = None, limit: int = 
         terms = [t for t in cleaned.split() if t]
         if not terms:
             return []
-        fts_query = " AND ".join(f'"{t}"*' for t in terms)
+        # High-recall FTS5: phrase match (precision) OR per-term match (recall)
+        term_queries = " OR ".join(f'"{t}"*' for t in terms)
+        if len(terms) > 1:
+            phrase = " ".join(terms)
+            fts_query = f'"{phrase}"* OR {term_queries}'
+        else:
+            fts_query = term_queries
 
         sql = "SELECT c.rowid, c.*, rank FROM chunks_fts c WHERE c.content MATCH ?"
         params = [fts_query]

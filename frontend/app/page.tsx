@@ -1109,13 +1109,40 @@ function ChatSection({ showToast, selectedDocs, setSelectedDocs, orgId, token, a
                 </svg>
                 {sources.length} source{sources.length > 1 ? "s" : ""}
               </summary>
-              <div className="flex flex-wrap gap-2 mt-2">
-                {sources.map((s, i) => (
-                  <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-xs text-slate-600 shadow-sm">
-                    <span className="font-medium">{s.document_title || s.document_id?.slice(0, 8)}</span>
-                    <span className="text-slate-300">·</span>
-                    <span className="text-slate-400">{(s.score * 100).toFixed(0)}%</span>
-                  </span>
+              <div className="flex flex-col gap-2 mt-2">
+                {sources.map((s: any, i: number) => (
+                  <a key={i}
+                    href={`${API}/api/v1/documents/${s.document_id}/file?organization_id=${orgId}`}
+                    target="_blank"
+                    className="block p-3 rounded-xl bg-white border border-slate-200 shadow-sm hover:shadow-md hover:border-indigo-300 hover:bg-indigo-50/30 transition-all no-underline group"
+                  >
+                    <div className="flex items-start gap-3">
+                      <div className="shrink-0 w-8 h-8 rounded-lg bg-red-50 border border-red-200 flex items-center justify-center text-red-500 group-hover:bg-red-100 transition-colors">
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                        </svg>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium text-slate-700 group-hover:text-indigo-700 truncate">
+                          {s.document_title || s.document_id?.slice(0, 8)}
+                        </div>
+                        <div className="flex items-center gap-2 mt-1">
+                          {s.document_type && (
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 uppercase tracking-wider">
+                              {s.document_type}
+                            </span>
+                          )}
+                          <span className="text-[10px] text-slate-400">·</span>
+                          <span className="text-[10px] font-medium text-indigo-500">
+                            {(s.score * 100).toFixed(0)}% match
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-0.5 group-hover:text-indigo-400">
+                          Click to open PDF →
+                        </div>
+                      </div>
+                    </div>
+                  </a>
                 ))}
               </div>
             </details>
@@ -1510,13 +1537,37 @@ function SearchSection({ showToast, orgId, token, onOpenDoc }: any) {
                 </svg>
                 {sources.length} source{sources.length > 1 ? "s" : ""}
               </summary>
-              <div className="flex flex-wrap gap-1.5 mt-1">
+              <div className="flex flex-col gap-1.5 mt-1">
                 {sources.map((s: any, i: number) => (
-                  <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-white border border-slate-200 text-[10px] text-slate-600 shadow-sm">
-                    <span className="font-medium">{s.document_title?.slice(0, 20) || s.document_id?.slice(0, 8)}</span>
-                    <span className="text-slate-300">·</span>
-                    <span className="text-slate-400">{(s.score * 100).toFixed(0)}%</span>
-                  </span>
+                  <a key={i}
+                    href={`${API}/api/v1/documents/${s.document_id}/file?organization_id=${orgId}`}
+                    target="_blank"
+                    className="block p-2.5 rounded-xl bg-white border border-slate-200 shadow-sm hover:shadow-md hover:border-indigo-300 hover:bg-indigo-50/30 transition-all no-underline group"
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <div className="shrink-0 w-7 h-7 rounded-lg bg-red-50 border border-red-200 flex items-center justify-center text-red-500 group-hover:bg-red-100 transition-colors">
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+                        </svg>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-medium text-slate-700 group-hover:text-indigo-700 truncate">
+                          {s.document_title?.slice(0, 20) || s.document_id?.slice(0, 8)}
+                        </div>
+                        <div className="flex items-center gap-1.5 mt-0.5">
+                          {s.document_type && (
+                            <span className="text-[9px] font-medium px-1 py-0.5 rounded bg-slate-100 text-slate-500 uppercase tracking-wider">
+                              {s.document_type}
+                            </span>
+                          )}
+                          <span className="text-[9px] text-slate-400">·</span>
+                          <span className="text-[9px] font-medium text-indigo-500">
+                            {(s.score * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </a>
                 ))}
               </div>
             </details>

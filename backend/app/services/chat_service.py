@@ -145,6 +145,44 @@ class ChatService:
             chat_log.warn(f"Extraction summary error: {e}")
             return ""
 
+    # Keyword → agent intent map for query-type detection (used when no doc is selected)
+    _AGENT_INTENT_KEYWORDS = {
+        "hr_agent": ["resume", "cv", "candidate", "candidates", "applicant", "applicants",
+                     "hiring", "recruit", "recruitment", "experience", "skill", "skills",
+                     "qualification", "interview", "employee"],
+        "finance_agent": ["invoice", "inv", "payment", "due date", "vendor", "supplier",
+                          "seller", "tax", "vat", "gst", "subtotal", "line item", "line items",
+                          "amount due", "bill to", "ship to", "purchase order", "po", "total amount",
+                          "رقم", "انوائس", "بل", "ٹوٹل", "وصولی"],
+        "sales_agent": ["rfq", "quotation", "quote", "suggestive", "required language",
+                        "bid", "tender", "proposal", "procurement", "request for quotation",
+                        "رقم", "کوٹیشن", "درخواست"],
+        "legal_agent": ["contract", "agreement", "clause", "liability", "terms and conditions",
+                        "legal", "party", "indemnity", "jurisdiction", "معاہدہ", "قانون"],
+    }
+
+    def _detect_query_agent(self, query: str) -> str | None:
+        """Detect the most likely document agent from query keywords.
+
+        Returns the agent name when intent is clear, or None when no/ambiguous intent
+        (so the caller can fall back to a generic Q&A agent).
+        """
+        q = (query or "").lower()
+        if not q:
+            return None
+        scores = {}
+        for agent, kws in self._AGENT_INTENT_KEYWORDS.items():
+            hits = sum(1 for kw in kws if kw in q)
+            if hits:
+                scores[agent] = hits
+        if not scores:
+            return None
+        # Only commit if a single intent clearly dominates (no tie)
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return None
+        return ranked[0][0]
+
     def chat_with_document(self, question: str, document_ids: list, organization_id: str,
                            document_type: str = None, phase3_agent: str = None,
                            status: str = None, date_from: str = None, date_to: str = None,
@@ -164,7 +202,7 @@ class ChatService:
             date_from=date_from,
             date_to=date_to,
             document_ids=resolved_ids if resolved_ids else None,
-            limit=15,
+            limit=20,
         )
         search_results = rag_service.hybrid_search(**hybrid_kwargs)
 
@@ -385,6 +423,15 @@ class ChatService:
         # Use selected-doc agents if available, otherwise fall back to search result agents
         dominant_source = doc_agent_counts if doc_agent_counts else agent_counts
         dominant_agent = max(dominant_source, key=dominant_source.get) if dominant_source else "other_agent"
+
+        # ── Smart agent when no document is explicitly selected ──
+        # Avoid forcing the majority agent (e.g. hr_agent for resumes) onto a question
+        # about invoices/RFQs. Detect intent from the query; fall back to a generic
+        # Q&A agent when intent is unclear so the LLM answers from whatever doc has it.
+        no_scope = not resolved_ids and not document_type and not phase3_agent
+        if no_scope:
+            detected = self._detect_query_agent(question)
+            dominant_agent = detected if detected else "other_agent"
 
         # Load the full agent .md prompt and adapt it for Q&A
         qa_prompt = ""

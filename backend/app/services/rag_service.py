@@ -580,7 +580,7 @@ class RAGService:
             if isinstance(alt, list) and len(alt) > 0:
                 valid = [q for q in alt if isinstance(q, str) and q.strip() and q != query]
                 print(f"[SEARCH] Query expansion: '{query}' → {valid}")
-                return valid[:2]
+                return valid[:3]
         except Exception as e:
             print(f"[SEARCH] Query expansion failed: {e}")
         return []
@@ -625,6 +625,38 @@ class RAGService:
             add_variant(f"invoice total {query}")
             add_variant(f"invoice number due date total {query}")
 
+        return list(variants)[:4]
+
+    def _expand_general_query(self, query: str) -> list[str]:
+        """Deterministic synonym expansion for resume / RFQ / legal / general concepts
+        (incl. Urdu) to improve recall without an extra LLM call."""
+        if not query:
+            return []
+        q = query.lower()
+        variants = set()
+
+        def add_variant(text: str):
+            clean = " ".join(text.split()).strip()
+            if clean and clean != query:
+                variants.add(clean)
+
+        synonym_map = [
+            (("resume", "cv", "c.v.", "bio data", "بائیو ڈیٹا", "ریزیومہ"), ["resume CV candidate experience skills"]),
+            (("candidate", "applicant", "امیدوار"), ["candidate applicant experience"]),
+            (("experience", "تجربہ"), ["work experience years skills"]),
+            (("skills", "مہارت"), ["skills technical communication"]),
+            (("rfq", "quotation", "quote", "request for quotation", "کوٹیشن", "درخواست"), ["rfq quotation required language suggestive language"]),
+            (("suggestive", "suggestive language"), ["suggestive language example GSA"]),
+            (("required language", "required text"), ["required language English documentation"]),
+            (("contract", "agreement", "معاہدہ"), ["contract agreement terms clause"]),
+            (("delivery", "deliver", "ترسیل"), ["delivery date days shipping"]),
+            (("pricing", "price", "قیمت"), ["pricing structure cost total"]),
+            (("deadline", "due date", "تاریخ"), ["deadline due date submission"]),
+        ]
+        for needles, replacements in synonym_map:
+            if any(n in q for n in needles):
+                for repl in replacements:
+                    add_variant(repl)
         return list(variants)[:4]
 
     def _build_structured_summary_text(self, document_ids: list[str], organization_id: str) -> str:
@@ -827,13 +859,71 @@ class RAGService:
                     key = r["document_id"] + "::" + str(r.get("chunk_index", r.get("chunk_text", "")[:80]))
                     r["_rrf_key"] = key
                 if key not in rrf_map:
-                    rrf_map[key] = {**r, "_rrf_score": 0.0, "_rank_sum": 0}
+                    rrf_map[key] = {**r, "_rrf_score": 0.0, "_rank_sum": 0, "_vec_sum": 0.0, "_vec_n": 0}
                 rrf_map[key]["_rrf_score"] += 1.0 / (k + rank)
                 rrf_map[key]["_rank_sum"] += rank
-        results = sorted(rrf_map.values(), key=lambda x: (-x["_rrf_score"], x["_rank_sum"]))
-        for r in results:
+                vs = r.get("score") or 0.0
+                rrf_map[key]["_vec_sum"] += vs
+                rrf_map[key]["_vec_n"] += 1
+        results = []
+        for r in rrf_map.values():
+            r["_vec_score"] = r["_vec_sum"] / r["_vec_n"] if r["_vec_n"] else 0.0
             r["score"] = r["_rrf_score"]
+            results.append(r)
+        results.sort(key=lambda x: (-x["_rrf_score"], x["_rank_sum"]))
         return results
+
+    _STOPWORDS = {"what", "is", "the", "a", "an", "of", "for", "to", "in", "on", "with",
+                  "and", "or", "does", "do", "did", "mean", "how", "why", "who", "which",
+                  "this", "that", "these", "those", "from", "by", "at", "as", "be", "are"}
+
+    _TYPE_KEYWORDS = {
+        "invoice": ["invoice", "inv ", "bill", "payment", "due date", "vendor", "tax", "vat",
+                    "gst", "subtotal", "line item", "amount due", "انوائس", "بل"],
+        "quotation": ["rfq", "quotation", "quote", "suggestive", "required language", "bid",
+                      "tender", "proposal", "procurement", "کوٹیشن"],
+        "resume": ["resume", "cv", "candidate", "applicant", "experience", "skill", "skills",
+                   "ریزیومہ", "امیدوار"],
+        "contract": ["contract", "agreement", "clause", "liability", "معاہدہ"],
+    }
+
+    def _rerank(self, results: list[dict], query: str, top_n: int = 30) -> list[dict]:
+        """Lightweight reranker (no external model → no hangs).
+
+        Combines three signals so chunks that are BOTH semantically and lexically
+        relevant rise to the top:
+          • keyword overlap (how many query terms appear in the chunk) — primary
+          • vector score    (cosine similarity from Pinecone/Supabase)
+          • RRF score       (cross-strategy rank, used mainly for tie-breaking)
+        A document-type boost is applied when the query clearly targets a doc type.
+        """
+        import re
+        raw_terms = [t for t in re.sub(r'[^\w\s]', ' ', (query or "").lower()).split()]
+        q_terms = [t for t in raw_terms if len(t) >= 2 and t not in self._STOPWORDS]
+        n_terms = max(1, len(q_terms))
+
+        # Detect target document type from query keywords
+        ql = query.lower()
+        type_boost = 0.0
+        for dtype, kws in self._TYPE_KEYWORDS.items():
+            if any(k in ql for k in kws):
+                type_boost = dtype
+                break
+
+        for r in results:
+            ct = (r.get("chunk_text") or "").lower()
+            overlap = sum(1 for t in q_terms if t and t in ct)
+            norm_overlap = min(overlap / n_terms, 1.0)
+            vec = max(0.0, min(1.0, r.get("_vec_score", 0.0)))
+            rrf = r.get("_rrf_score", 0.0)
+            rrf_norm = min(rrf / (1.0 / 60.0), 1.0)
+            score = 0.15 * rrf_norm + 0.30 * vec + 0.55 * norm_overlap
+            # Boost chunks whose document_type matches the query's apparent intent
+            if type_boost and r.get("document_type") == type_boost:
+                score += 0.15
+            r["_combined"] = score
+        results.sort(key=lambda x: -x["_combined"])
+        return results[:top_n] if top_n else results
 
     def _fetch_neighbor_chunks(self, chunks: list[dict], org_id: str) -> list[dict]:
         """For each chunk, attach text of neighboring chunks (previous/next by chunk_index) for context."""
@@ -853,7 +943,7 @@ class RAGService:
             try:
                 result = SupabaseDB.select("document_chunks",
                     columns="chunk_index, content",
-                    filters={"document_id": did, "organization_id": org_id, "chunk_type": "paragraph"},
+                    filters={"document_id": did, "organization_id": org_id},
                     limit=50,
                 )
                 all_chunks = getattr(result, "data", result if isinstance(result, list) else [])
@@ -1232,8 +1322,9 @@ class RAGService:
         from .orchestration_logger import get_chat_logger
         chat_log = get_chat_logger()
 
-        # Default to only searching processed documents
-        effective_status = status if status else "processed"
+        # When no explicit status filter is given, do NOT restrict to "processed" only.
+        # This lets the search span ALL documents in the org (e.g. when no doc is selected).
+        effective_status = status
 
         # Resolve doc-level filters into document_ids
         filter_doc_ids = self._resolve_doc_filters(
@@ -1259,6 +1350,7 @@ class RAGService:
         # ── Query expansion: generate alternative phrasings for better recall ──
         alt_queries = self._expand_query(query)
         alt_queries.extend(self._expand_finance_query(query))
+        alt_queries.extend(self._expand_general_query(query))
         # Preserve order while dropping duplicates
         deduped_alt = []
         seen_alt = set()
@@ -1295,10 +1387,12 @@ class RAGService:
         pinecone_seen_ids = set()
         if pinecone_service.available:
             pf = _pinecone_filter()
-            print(f"[SEARCH] Querying Pinecone (ns='{organization_id}') with {len(all_embeddings)} embeddings...")
+            # When searching ALL documents (no doc selected), scan many more chunks for recall
+            pinecone_top_k = (limit * 4 + 20) if not document_ids else (limit + 10)
+            print(f"[SEARCH] Querying Pinecone (ns='{organization_id}') with {len(all_embeddings)} embeddings, top_k={pinecone_top_k}...")
             for ei, emb in enumerate(all_embeddings):
                 tag = f"alt{ei}" if ei > 0 else "orig"
-                pr = pinecone_service.query(emb, top_k=limit + 10, filter=pf, namespace=organization_id)
+                pr = pinecone_service.query(emb, top_k=pinecone_top_k, filter=pf, namespace=organization_id)
                 if pr:
                     print(f"[SEARCH] Pinecone [{tag}]: {len(pr)} results")
                     for r in pr:
@@ -1445,13 +1539,13 @@ class RAGService:
         per_strategy.append(like_res)
 
         # ──── 4. Supabase vector search ────
-        chat_log.search_strategy("Supabase Vector Search", f"threshold=0.3, top_k={limit * 2}")
+        chat_log.search_strategy("Supabase Vector Search", f"threshold=0.2, top_k={limit * 2}")
         sqs_res = []
         try:
             vector_results = SupabaseDB.search_vector(
                 "document_chunks",
                 query_embedding,
-                match_threshold=0.3,
+                match_threshold=0.2,
                 match_count=limit * 2,
                 filter_org_id=organization_id,
             )
@@ -1494,6 +1588,10 @@ class RAGService:
             results = []
         chat_log.info(f"RRF fused {len(filtered_strategies)} strategies → {len(results)} unique chunks")
 
+        # ── Lightweight rerank (RRF + vector similarity + keyword overlap) ──
+        if results:
+            results = self._rerank(results, query, limit * 2)
+
         # Attach cv_score to resume search results
         cv_doc_ids = list(set(r["document_id"] for r in results if r.get("document_type") == "resume"))
         cv_scores = self._fetch_doc_cv_scores(cv_doc_ids, organization_id) if cv_doc_ids else {}
@@ -1506,6 +1604,20 @@ class RAGService:
 
         # Neighbor chunks for context
         results = self._fetch_neighbor_chunks(results[:limit * 2], organization_id)
+
+        # Diversity cap: avoid one document dominating the context. Keep at most
+        # MAX_PER_DOC chunks per document so multiple relevant docs are represented.
+        MAX_PER_DOC = 2
+        if document_ids is None:
+            capped = []
+            per_doc = {}
+            for r in results:
+                did = r.get("document_id", "")
+                if per_doc.get(did, 0) >= MAX_PER_DOC:
+                    continue
+                per_doc[did] = per_doc.get(did, 0) + 1
+                capped.append(r)
+            results = capped
 
         final = results[offset:offset + limit]
         chat_log.info(f"Total after RRF+filter: {len(final)} chunks (from {len(results)} unique)")
