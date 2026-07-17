@@ -17,6 +17,27 @@ _AGGREGATE_KEYWORDS = [r"\bsum\b", r"\btotal\b", r"\baggregate\b", r"\bcombine\b
                        r"\btotal\b.*\ball\b", r"\badd up\b", r"\bsum up\b",
                        r"\baccumulated\b", r"\bcombined\b", r"\btogether\b"]
 
+# ── Cross-document search triggers ──
+# When query matches these (or no doc is selected), switch from hybrid_search
+# to aggregate_search so every document contributes at least 1 chunk.
+_CROSS_DOC_PHRASES = [
+    "saare numbers", "sab numbers", "all numbers", "har file",
+    "saari files", "sari files", "all files", "sab files",
+    "har document", "all documents", "saare documents",
+    "saare phone", "sab phone", "all phone",
+    "every file", "every document", "all data",
+    "all info", "saari information", "sari information",
+    "har ek", "each file", "each document",
+]
+_CROSS_DOC_WORDS = [
+    "saare", "saari", "sari", "sab", "har", "tamam",
+]
+_CROSS_DOC_DROP = {
+    "a", "an", "the", "is", "are", "was", "were",
+    "in", "on", "at", "to", "for", "of", "with", "by",
+    "mai", "mein", "say", "se", "laa", "kr", "kar", "par",
+}
+
 
 class ChatService:
     def _get_or_create_session(self, session_id: str, organization_id: str, document_ids: list = None) -> tuple[str, list, bool]:
@@ -204,7 +225,32 @@ class ChatService:
             document_ids=resolved_ids if resolved_ids else None,
             limit=20,
         )
-        search_results = rag_service.hybrid_search(**hybrid_kwargs)
+
+        # ── Cross-document intent detection ──
+        # When no doc is selected, or query asks for all/saare/sab/har files,
+        # switch to aggregate_search so every doc contributes ≥1 chunk.
+        q_lower = question.lower().strip()
+        is_cross_doc = not resolved_ids  # no doc selected → search all visible
+        if not is_cross_doc and len(q_lower.split()) <= 12:
+            for phrase in _CROSS_DOC_PHRASES:
+                if phrase in q_lower:
+                    is_cross_doc = True
+                    break
+            if not is_cross_doc:
+                words = [w for w in q_lower.split() if w not in _CROSS_DOC_DROP and len(w) >= 2]
+                if any(w in _CROSS_DOC_WORDS for w in words):
+                    is_cross_doc = True
+
+        if is_cross_doc:
+            chat_log.info(f"Cross-doc intent detected — using aggregate_search")
+            search_results = rag_service.aggregate_search(
+                query=question,
+                organization_id=organization_id,
+                document_ids=resolved_ids if resolved_ids else None,
+                max_docs=150,
+            )
+        else:
+            search_results = rag_service.hybrid_search(**hybrid_kwargs)
 
         q_lower = question.lower()
         is_resume_query = any(
@@ -324,6 +370,25 @@ class ChatService:
 
         context = "\n\n".join(context_parts)
         context_len = len(context)
+
+        # Truncate context to stay within Groq free-tier input limits (12K TPM,
+        # ≈7K tokens).  Aggregate_search can produce many chunks; without this
+        # cap, the LLM call fails with a 413 "Request too large" error.
+        MAX_CONTEXT_CHARS = 28000
+        if len(context) > MAX_CONTEXT_CHARS:
+            kept_parts, kept_sources = [], []
+            total = 0
+            for part, src in zip(context_parts, sources):
+                added = len(part) + 2
+                if total + added > MAX_CONTEXT_CHARS:
+                    break
+                kept_parts.append(part)
+                kept_sources.append(src)
+                total += added
+            context = "\n\n".join(kept_parts)
+            sources = kept_sources
+            context_len = len(context)
+            chat_log.info(f"Truncated context to {context_len} chars ({len(sources)} sources)")
 
         # ── Attach file_url to sources for frontend file name display ──
         try:

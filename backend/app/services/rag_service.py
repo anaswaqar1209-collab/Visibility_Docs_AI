@@ -1724,5 +1724,86 @@ class RAGService:
             logging.getLogger("visibility-docs").error(f"find_similar error: {e}")
             return []
 
+    def _list_org_document_ids(self, organization_id: str, limit: int = 150,
+                                document_type: str = None,
+                                phase3_agent: str = None) -> list[str]:
+        """List document IDs for an organization, up to ``limit``."""
+        try:
+            filters = {"organization_id": organization_id}
+            if document_type:
+                filters["document_type"] = document_type
+            if phase3_agent:
+                filters["phase3_agent"] = phase3_agent
+            result = SupabaseDB.select("documents",
+                columns="id",
+                filters=filters,
+            )
+            data = getattr(result, "data", result if isinstance(result, list) else [])
+            if isinstance(data, list):
+                return [row["id"] for row in data[:limit] if isinstance(row, dict) and row.get("id")]
+            return []
+        except Exception:
+            return []
+
+    def aggregate_search(self, query: str, organization_id: str,
+                         document_ids: list = None,
+                         max_docs: int = 150) -> list[dict]:
+        """
+        Broad cross-document search that guarantees every document contributes
+        at least 1 relevant chunk.  Two-phase strategy:
+
+        1. Broad fused hybrid_search with high recall (limit = min(2*ndocs, 400)).
+        2. Per-document fallback for any doc that the broad pass missed.
+        """
+        from .orchestration_logger import get_chat_logger
+        chat_log = get_chat_logger()
+
+        # Phase 0 – resolve the document set
+        target_ids = document_ids or self._list_org_document_ids(organization_id, limit=max_docs)
+        if not target_ids:
+            return []
+        chat_log.info(f"Aggregate search targeting {len(target_ids)} docs")
+
+        # Phase 1 – broad fused search
+        broad_limit = min(len(target_ids) * 2, 400)
+        broad_kwargs = dict(
+            query=query,
+            organization_id=organization_id,
+            document_ids=target_ids,
+            limit=broad_limit,
+        )
+        broad_results = self.hybrid_search(**broad_kwargs)
+        covered = set(r["document_id"] for r in broad_results)
+        chat_log.info(f"Broad pass covered {len(covered)}/{len(target_ids)} docs ({len(broad_results)} chunks)")
+
+        # Phase 2 – per-doc fallback for uncovered documents
+        uncovered = [did for did in target_ids if did not in covered]
+        fallback = []
+        if uncovered:
+            for did in uncovered:
+                try:
+                    per = self.hybrid_search(query, organization_id, document_ids=[did], limit=1)
+                    if per:
+                        fallback.append(per[0])
+                except Exception:
+                    continue
+            chat_log.info(f"Fallback added {len(fallback)} chunks from {len(uncovered)} uncovered docs")
+            covered.update(r["document_id"] for r in fallback)
+
+        # Merge, dedupe, rerank
+        merged = broad_results + fallback
+        seen = set()
+        deduped = []
+        for r in merged:
+            key = (r.get("document_id", ""), r.get("page_number", ""), r.get("chunk_text", "")[:80])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(r)
+        if deduped:
+            deduped = self._rerank(deduped, query, len(deduped))
+        deduped = self._fetch_neighbor_chunks(deduped, organization_id)
+        chat_log.info(f"Aggregate search final: {len(deduped)} chunks across {len(set(r['document_id'] for r in deduped))} docs")
+        return deduped
+
 
 rag_service = RAGService()
