@@ -11,17 +11,35 @@ _CHAPTER_RE = None
 
 
 def _get_patterns():
-    global _NUMERED_RE, _CHAPTER_RE
+    global _NUMBERED_RE, _CHAPTER_RE
     if _NUMERED_RE is None:
         import re
-        _NUMERED_RE = re.compile(r'^\d+(?:\.\d+)*(?:\s+|\.\s+)(.+)')
+        _NUMBERED_RE = re.compile(r'^\d+(?:\.\d+)*(?:\s+|\.\s+)(.+)')
         _CHAPTER_RE = re.compile(r'^(?:chapter|section|appendix|part|article)\s+\d+', re.IGNORECASE)
-    return _NUMERED_RE, _CHAPTER_RE
+    return _NUMBERED_RE, _CHAPTER_RE
+
+
+# Field-label detection: lines like "Suggestive Language:", "Required Language:",
+# "Example:", "Note:", "Background:" etc. that act as sub-headings inside a section.
+_LABEL_COLON_RE = None
+_TITLECASE_RE = None
+
+
+def _get_label_patterns():
+    global _LABEL_COLON_RE, _TITLECASE_RE
+    if _LABEL_COLON_RE is None:
+        import re
+        # Short label ending with a colon, starts with a capital letter
+        _LABEL_COLON_RE = re.compile(r'^([A-Z][A-Za-z0-9\s\'"\-&/()]{1,79}):\s*$')
+        # Title-Case short label (e.g. "Suggestive Language") without trailing punctuation
+        _TITLECASE_RE = re.compile(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,7})$')
+    return _LABEL_COLON_RE, _TITLECASE_RE
 
 
 def _detect_headings_from_file(file_path: str) -> list[dict]:
     import fitz
     numbered_re, chapter_re = _get_patterns()
+    label_colon_re, _ = _get_label_patterns()
 
     doc = fitz.open(file_path)
     page_height = doc[0].rect.height if doc.page_count > 0 else 842
@@ -80,6 +98,11 @@ def _detect_headings_from_file(file_path: str) -> list[dict]:
             if chapter_re.match(txt):
                 is_heading = True
                 level = 1
+            m_label = label_colon_re.match(txt)
+            if m_label:
+                is_heading = True
+                level = 3
+                txt = m_label.group(1).strip()
             if txt.isupper() and len(txt) > 3 and len(txt) < 60 and not is_bold:
                 is_heading = True
                 level = min(level, 2) if level else 2
@@ -112,6 +135,7 @@ def _detect_headings_from_file(file_path: str) -> list[dict]:
 
 def _detect_headings_from_text(text: str) -> list[dict]:
     numbered_re, chapter_re = _get_patterns()
+    label_colon_re, titlecase_re = _get_label_patterns()
     headings = []
     lines = text.split("\n")
     body_sizes = [len(l.split()) for l in lines if l.strip()]
@@ -131,6 +155,12 @@ def _detect_headings_from_text(text: str) -> list[dict]:
                 headings.append({"heading": stripped, "level": 3})
         elif chapter_re.match(stripped):
             headings.append({"heading": stripped, "level": 1})
+        elif label_colon_re.match(stripped):
+            m = label_colon_re.match(stripped)
+            headings.append({"heading": m.group(1).strip(), "level": 3})
+        elif titlecase_re.match(stripped) and len(stripped) <= 60 and len(stripped.split()) >= 2:
+            # Title-Case short label without colon (e.g. "Suggestive Language")
+            headings.append({"heading": stripped, "level": 3})
         elif stripped.isupper() and len(stripped) > 3 and len(stripped) < 80:
             word_count = len(stripped.split())
             if word_count < avg_line_words * 0.7:
@@ -153,7 +183,19 @@ def _merge_headings(text_headings: list[dict], pdf_headings: list[dict]) -> list
 def _build_sections(text: str, headings: list[dict]) -> list[dict]:
     if not headings:
         return []
+    # Retain any preamble (text before the first detected heading) as its own
+    # section. Without this, form-like documents (invoices/RFQs with "Label: value"
+    # lines) lose all their field content when the first real heading appears late.
+    first_heading = headings[0]["heading"]
+    first_idx = text.find(first_heading)
+    preamble = text[:first_idx].strip() if first_idx > 0 else ""
     raw_sections = []
+    if preamble:
+        raw_sections.append({
+            "heading": "",
+            "content": preamble,
+            "level": 1,
+        })
     search_pos = 0
     for i, h in enumerate(headings):
         start_text = h["heading"]
@@ -193,10 +235,9 @@ def _build_sections(text: str, headings: list[dict]) -> list[dict]:
                 buffer = None
             merged.append(sec)
     if buffer:
-        if merged:
-            merged[-1]["content"] += "\n" + buffer["content"]
-        else:
-            merged.append(buffer)
+        # Keep trailing tiny section as its own chunk (don't merge into previous
+        # section) so field labels like "Required Language" stay retrievable.
+        merged.append(buffer)
     return merged
 
 
@@ -551,7 +592,7 @@ class RAGService:
             if isinstance(alt, list) and len(alt) > 0:
                 valid = [q for q in alt if isinstance(q, str) and q.strip() and q != query]
                 print(f"[SEARCH] Query expansion: '{query}' → {valid}")
-                return valid[:2]
+                return valid[:3]
         except Exception as e:
             print(f"[SEARCH] Query expansion failed: {e}")
         return []
@@ -596,6 +637,38 @@ class RAGService:
             add_variant(f"invoice total {query}")
             add_variant(f"invoice number due date total {query}")
 
+        return list(variants)[:4]
+
+    def _expand_general_query(self, query: str) -> list[str]:
+        """Deterministic synonym expansion for resume / RFQ / legal / general concepts
+        (incl. Urdu) to improve recall without an extra LLM call."""
+        if not query:
+            return []
+        q = query.lower()
+        variants = set()
+
+        def add_variant(text: str):
+            clean = " ".join(text.split()).strip()
+            if clean and clean != query:
+                variants.add(clean)
+
+        synonym_map = [
+            (("resume", "cv", "c.v.", "bio data", "بائیو ڈیٹا", "ریزیومہ"), ["resume CV candidate experience skills"]),
+            (("candidate", "applicant", "امیدوار"), ["candidate applicant experience"]),
+            (("experience", "تجربہ"), ["work experience years skills"]),
+            (("skills", "مہارت"), ["skills technical communication"]),
+            (("rfq", "quotation", "quote", "request for quotation", "کوٹیشن", "درخواست"), ["rfq quotation required language suggestive language"]),
+            (("suggestive", "suggestive language"), ["suggestive language example GSA"]),
+            (("required language", "required text"), ["required language English documentation"]),
+            (("contract", "agreement", "معاہدہ"), ["contract agreement terms clause"]),
+            (("delivery", "deliver", "ترسیل"), ["delivery date days shipping"]),
+            (("pricing", "price", "قیمت"), ["pricing structure cost total"]),
+            (("deadline", "due date", "تاریخ"), ["deadline due date submission"]),
+        ]
+        for needles, replacements in synonym_map:
+            if any(n in q for n in needles):
+                for repl in replacements:
+                    add_variant(repl)
         return list(variants)[:4]
 
     def _build_structured_summary_text(self, document_ids: list[str], organization_id: str) -> str:
@@ -798,13 +871,71 @@ class RAGService:
                     key = r["document_id"] + "::" + str(r.get("chunk_index", r.get("chunk_text", "")[:80]))
                     r["_rrf_key"] = key
                 if key not in rrf_map:
-                    rrf_map[key] = {**r, "_rrf_score": 0.0, "_rank_sum": 0}
+                    rrf_map[key] = {**r, "_rrf_score": 0.0, "_rank_sum": 0, "_vec_sum": 0.0, "_vec_n": 0}
                 rrf_map[key]["_rrf_score"] += 1.0 / (k + rank)
                 rrf_map[key]["_rank_sum"] += rank
-        results = sorted(rrf_map.values(), key=lambda x: (-x["_rrf_score"], x["_rank_sum"]))
-        for r in results:
+                vs = r.get("score") or 0.0
+                rrf_map[key]["_vec_sum"] += vs
+                rrf_map[key]["_vec_n"] += 1
+        results = []
+        for r in rrf_map.values():
+            r["_vec_score"] = r["_vec_sum"] / r["_vec_n"] if r["_vec_n"] else 0.0
             r["score"] = r["_rrf_score"]
+            results.append(r)
+        results.sort(key=lambda x: (-x["_rrf_score"], x["_rank_sum"]))
         return results
+
+    _STOPWORDS = {"what", "is", "the", "a", "an", "of", "for", "to", "in", "on", "with",
+                  "and", "or", "does", "do", "did", "mean", "how", "why", "who", "which",
+                  "this", "that", "these", "those", "from", "by", "at", "as", "be", "are"}
+
+    _TYPE_KEYWORDS = {
+        "invoice": ["invoice", "inv ", "bill", "payment", "due date", "vendor", "tax", "vat",
+                    "gst", "subtotal", "line item", "amount due", "انوائس", "بل"],
+        "quotation": ["rfq", "quotation", "quote", "suggestive", "required language", "bid",
+                      "tender", "proposal", "procurement", "کوٹیشن"],
+        "resume": ["resume", "cv", "candidate", "applicant", "experience", "skill", "skills",
+                   "ریزیومہ", "امیدوار"],
+        "contract": ["contract", "agreement", "clause", "liability", "معاہدہ"],
+    }
+
+    def _rerank(self, results: list[dict], query: str, top_n: int = 30) -> list[dict]:
+        """Lightweight reranker (no external model → no hangs).
+
+        Combines three signals so chunks that are BOTH semantically and lexically
+        relevant rise to the top:
+          • keyword overlap (how many query terms appear in the chunk) — primary
+          • vector score    (cosine similarity from Pinecone/Supabase)
+          • RRF score       (cross-strategy rank, used mainly for tie-breaking)
+        A document-type boost is applied when the query clearly targets a doc type.
+        """
+        import re
+        raw_terms = [t for t in re.sub(r'[^\w\s]', ' ', (query or "").lower()).split()]
+        q_terms = [t for t in raw_terms if len(t) >= 2 and t not in self._STOPWORDS]
+        n_terms = max(1, len(q_terms))
+
+        # Detect target document type from query keywords
+        ql = query.lower()
+        type_boost = 0.0
+        for dtype, kws in self._TYPE_KEYWORDS.items():
+            if any(k in ql for k in kws):
+                type_boost = dtype
+                break
+
+        for r in results:
+            ct = (r.get("chunk_text") or "").lower()
+            overlap = sum(1 for t in q_terms if t and t in ct)
+            norm_overlap = min(overlap / n_terms, 1.0)
+            vec = max(0.0, min(1.0, r.get("_vec_score", 0.0)))
+            rrf = r.get("_rrf_score", 0.0)
+            rrf_norm = min(rrf / (1.0 / 60.0), 1.0)
+            score = 0.15 * rrf_norm + 0.30 * vec + 0.55 * norm_overlap
+            # Boost chunks whose document_type matches the query's apparent intent
+            if type_boost and r.get("document_type") == type_boost:
+                score += 0.15
+            r["_combined"] = score
+        results.sort(key=lambda x: -x["_combined"])
+        return results[:top_n] if top_n else results
 
     def _fetch_neighbor_chunks(self, chunks: list[dict], org_id: str) -> list[dict]:
         """For each chunk, attach text of neighboring chunks (previous/next by chunk_index) for context."""
@@ -824,7 +955,7 @@ class RAGService:
             try:
                 result = SupabaseDB.select("document_chunks",
                     columns="chunk_index, content",
-                    filters={"document_id": did, "organization_id": org_id, "chunk_type": "paragraph"},
+                    filters={"document_id": did, "organization_id": org_id},
                     limit=50,
                 )
                 all_chunks = getattr(result, "data", result if isinstance(result, list) else [])
@@ -853,7 +984,7 @@ class RAGService:
             key = c["document_id"] + "::" + str(c.get("chunk_index", ""))
             if key in neighbor_texts and neighbor_texts[key]:
                 nt = neighbor_texts[key][0]
-                if nt != c.get("chunk_text", ""):
+                if nt and nt != c.get("chunk_text", ""):
                     c["chunk_text"] = nt
         return chunks
 
@@ -927,7 +1058,8 @@ class RAGService:
 
         return chunks
 
-    def index_document(self, document_id: str, organization_id: str, text: str, file_path: str = None, page_number: int = None):
+    def index_document(self, document_id: str, organization_id: str, text: str, file_path: str = None,
+                       page_number: int = None, document_type: str = None, machine_id: str = None, filename: str = None):
         print(f"\n[INDEX] Indexing document {document_id[:12] if document_id else '?'}... ({len(text)} chars)")
 
         headings = []
@@ -959,22 +1091,45 @@ class RAGService:
             return
         print(f"[INDEX] Generated {len(chunks)} chunks")
 
+        # Build enriched chunk metadata for embedding + storage
+        import re as _re
+        chunk_metadata = []
+        for c in chunks:
+            heading = c.get("heading", "")
+            sec_num = ""
+            if heading:
+                m = _re.match(r'^(\d+(?:\.\d+)*)', heading.strip())
+                if m:
+                    sec_num = m.group(1)
+            chunk_metadata.append({
+                "heading": heading,
+                "page_number": page_number,
+                "document_type": document_type,
+                "section": c.get("chunk_type", ""),
+                "section_number": sec_num,
+                "machine_id": machine_id,
+                "filename": filename or (file_path.split("\\")[-1] if file_path else ""),
+            })
+
         embeddings = embedding_service.embed_chunks(
             [c["content"] for c in chunks],
             document_id=document_id,
             organization_id=organization_id,
+            chunk_metadata=chunk_metadata,
         )
         print(f"[INDEX] Got {len(embeddings)} embeddings")
 
         try:
             chunk_records = []
             emb_records = []
-            for chunk, embedding in zip(chunks, embeddings):
+            for chunk, embedding, cm in zip(chunks, embeddings, chunk_metadata):
                 heading = chunk.get("heading")
                 ctype = chunk.get("chunk_type", "paragraph")
                 meta = {"chunk_index": chunk.get("chunk_index", 0), "word_count": chunk.get("word_count", 0)}
                 if heading:
                     meta["heading"] = heading
+                section = cm.get("section", "")
+                section_number = cm.get("section_number", "")
                 chunk_records.append({
                     "organization_id": organization_id,
                     "document_id": document_id,
@@ -982,6 +1137,10 @@ class RAGService:
                     "chunk_index": chunk.get("chunk_index", 0),
                     "chunk_type": ctype,
                     "heading": heading,
+                    "section": section,
+                    "section_number": section_number,
+                    "machine_id": machine_id,
+                    "filename": cm.get("filename", ""),
                     "content": chunk["content"],
                     "chunk_text": chunk["content"],
                     "metadata": meta,
@@ -992,7 +1151,13 @@ class RAGService:
                     "embedding": embedding,
                     "model_name": "all-MiniLM-L6-v2",
                 })
-            SupabaseDB.batch_insert("document_chunks", chunk_records)
+            # Insert chunks first to get their IDs for chunk_id in embeddings
+            inserted = SupabaseDB.batch_insert("document_chunks", chunk_records)
+            if inserted:
+                for i, rec in enumerate(inserted):
+                    rid = rec.get("id") if isinstance(rec, dict) else None
+                    if rid is not None and i < len(emb_records):
+                        emb_records[i]["chunk_id"] = rid
             SupabaseDB.batch_insert("document_embeddings", emb_records)
             print(f"[INDEX] Saved {len(chunk_records)} chunks + {len(emb_records)} embeddings to DB")
         except Exception as e:
@@ -1165,38 +1330,32 @@ class RAGService:
     def hybrid_search(self, query: str, organization_id: str, document_type: str = None,
                       phase3_agent: str = None, status: str = None,
                       date_from: str = None, date_to: str = None,
-                      document_ids: list = None, limit: int = 20, offset: int = 0) -> list[dict]:
+                      document_ids: list = None, limit: int = 20, offset: int = 0,
+                      aggregate: bool = False) -> list[dict]:
         from .orchestration_logger import get_chat_logger
         chat_log = get_chat_logger()
 
-        # Default to only searching processed documents
-        effective_status = status if status else "processed"
+        # When no explicit status filter is given, do NOT restrict to "processed" only.
+        # This lets the search span ALL documents in the org (e.g. when no doc is selected).
+        effective_status = status
 
-        # Explicit selection from chat scope (must never fall back to "all docs")
-        explicit_doc_ids = list(document_ids) if document_ids is not None else None
-
-        # When caller already scoped to specific docs, skip status filter so
-        # selected IDs are not wiped (empty ∩ status → previously searched ALL).
-        filter_status = None if explicit_doc_ids is not None else effective_status
+        # Resolve doc-level filters into document_ids
         filter_doc_ids = self._resolve_doc_filters(
             organization_id=organization_id,
             document_type=document_type,
             phase3_agent=phase3_agent,
-            status=filter_status,
+            status=effective_status,
             date_from=date_from,
             date_to=date_to,
         )
-        if explicit_doc_ids is not None:
-            if filter_doc_ids is not None:
-                merged = set(explicit_doc_ids) & set(filter_doc_ids)
-                # Keep explicit selection even if status/type filter matched nothing
-                document_ids = list(merged) if merged else list(explicit_doc_ids)
+        if filter_doc_ids is not None:
+            if document_ids:
+                merged_set = set(document_ids) & set(filter_doc_ids)
+                document_ids = list(merged_set) if merged_set else []
             else:
-                document_ids = list(explicit_doc_ids)
-        elif filter_doc_ids is not None:
-            document_ids = filter_doc_ids
+                document_ids = filter_doc_ids
 
-        print(f"\n[SEARCH] Query: '{query}' | org={organization_id} | type={document_type or 'all'} | agent={phase3_agent or 'all'} | status={status or 'all'} | docs={len(document_ids) if document_ids is not None else 'all'} | limit={limit}")
+        print(f"\n[SEARCH] Query: '{query}' | org={organization_id} | type={document_type or 'all'} | agent={phase3_agent or 'all'} | status={status or 'all'} | docs={len(document_ids) if document_ids else 'all'} | limit={limit}")
         query_embedding = embedding_service.embed_query(query)
         import re
         query_words = [w for w in re.sub(r'[^\w\s]', ' ', query).lower().split() if len(w) >= 2]
@@ -1204,6 +1363,7 @@ class RAGService:
         # ── Query expansion: generate alternative phrasings for better recall ──
         alt_queries = self._expand_query(query)
         alt_queries.extend(self._expand_finance_query(query))
+        alt_queries.extend(self._expand_general_query(query))
         # Preserve order while dropping duplicates
         deduped_alt = []
         seen_alt = set()
@@ -1240,10 +1400,12 @@ class RAGService:
         pinecone_seen_ids = set()
         if pinecone_service.available:
             pf = _pinecone_filter()
-            print(f"[SEARCH] Querying Pinecone (ns='{organization_id}') with {len(all_embeddings)} embeddings...")
+            # When searching ALL documents (no doc selected), scan many more chunks for recall
+            pinecone_top_k = (limit * 4 + 20) if not document_ids else (limit + 10)
+            print(f"[SEARCH] Querying Pinecone (ns='{organization_id}') with {len(all_embeddings)} embeddings, top_k={pinecone_top_k}...")
             for ei, emb in enumerate(all_embeddings):
                 tag = f"alt{ei}" if ei > 0 else "orig"
-                pr = pinecone_service.query(emb, top_k=limit + 10, filter=pf, namespace=organization_id)
+                pr = pinecone_service.query(emb, top_k=pinecone_top_k, filter=pf, namespace=organization_id)
                 if pr:
                     print(f"[SEARCH] Pinecone [{tag}]: {len(pr)} results")
                     for r in pr:
@@ -1270,6 +1432,11 @@ class RAGService:
                         "phase3_agent": p3a,
                         "chunk_text": meta.get("chunk_text", "")[:3000],
                         "page_number": meta.get("page_number"),
+                        "heading": meta.get("heading"),
+                        "section": meta.get("section"),
+                        "section_number": meta.get("section_number"),
+                        "machine_id": meta.get("machine_id"),
+                        "filename": meta.get("filename"),
                         "chunk_index": ci,
                         "score": r.get("score", 0),
                         "metadata": meta,
@@ -1306,6 +1473,11 @@ class RAGService:
                         "phase3_agent": p3a,
                         "chunk_text": item.get("content", "")[:3000],
                         "page_number": item.get("page_id"),
+                        "heading": item.get("heading"),
+                        "section": item.get("section"),
+                        "section_number": item.get("section_number"),
+                        "machine_id": item.get("machine_id"),
+                        "filename": item.get("filename"),
                         "chunk_index": item.get("chunk_index"),
                         "score": 0.9,
                         "metadata": item.get("metadata"),
@@ -1363,6 +1535,11 @@ class RAGService:
                             "phase3_agent": p3a,
                             "chunk_text": item.get("content", "")[:3000],
                             "page_number": item.get("page_id"),
+                            "heading": item.get("heading"),
+                            "section": item.get("section"),
+                            "section_number": item.get("section_number"),
+                            "machine_id": item.get("machine_id"),
+                            "filename": item.get("filename"),
                             "chunk_index": item.get("chunk_index"),
                             "score": 0.7,
                             "metadata": item.get("metadata"),
@@ -1375,13 +1552,13 @@ class RAGService:
         per_strategy.append(like_res)
 
         # ──── 4. Supabase vector search ────
-        chat_log.search_strategy("Supabase Vector Search", f"threshold=0.5, top_k={limit * 2}")
+        chat_log.search_strategy("Supabase Vector Search", f"threshold=0.2, top_k={limit * 2}")
         sqs_res = []
         try:
             vector_results = SupabaseDB.search_vector(
                 "document_chunks",
                 query_embedding,
-                match_threshold=0.5,
+                match_threshold=0.2,
                 match_count=limit * 2,
                 filter_org_id=organization_id,
             )
@@ -1404,6 +1581,11 @@ class RAGService:
                 "phase3_agent": p3a,
                 "chunk_text": chunk.get("content", chunk.get("chunk_text", "")),
                 "page_number": chunk.get("page_number", chunk.get("page_id")),
+                "heading": chunk.get("heading"),
+                "section": chunk.get("section"),
+                "section_number": chunk.get("section_number"),
+                "machine_id": chunk.get("machine_id"),
+                "filename": chunk.get("filename"),
                 "chunk_index": chunk.get("chunk_index"),
                 "score": chunk.get("similarity", chunk.get("score", 0)),
                 "metadata": chunk.get("metadata"),
@@ -1419,21 +1601,38 @@ class RAGService:
             results = []
         chat_log.info(f"RRF fused {len(filtered_strategies)} strategies → {len(results)} unique chunks")
 
+        # ── Lightweight rerank (RRF + vector similarity + keyword overlap) ──
+        if results:
+            results = self._rerank(results, query, limit * 2)
+
         # Attach cv_score to resume search results
         cv_doc_ids = list(set(r["document_id"] for r in results if r.get("document_type") == "resume"))
         cv_scores = self._fetch_doc_cv_scores(cv_doc_ids, organization_id) if cv_doc_ids else {}
         for r in results:
             r["cv_score"] = cv_scores.get(r["document_id"])
 
-        if document_ids is not None:
+        if document_ids:
             doc_set = set(document_ids)
-            results = [r for r in results if r.get("document_id") in doc_set]
+            results = [r for r in results if r["document_id"] in doc_set]
 
-        # Neighbor chunks for context (re-filter so neighbors stay in scope)
+        # Neighbor chunks for context
         results = self._fetch_neighbor_chunks(results[:limit * 2], organization_id)
-        if document_ids is not None:
-            doc_set = set(document_ids)
-            results = [r for r in results if r.get("document_id") in doc_set]
+
+        # Diversity cap: avoid one document dominating the context. Keep at most
+        # MAX_PER_DOC chunks per document so multiple relevant docs are represented.
+        # In aggregate mode we relax the cap so EVERY document that mentions the
+        # requested field contributes its relevant chunks (cross-document scan).
+        MAX_PER_DOC = 10 if aggregate else 2
+        if document_ids is None:
+            capped = []
+            per_doc = {}
+            for r in results:
+                did = r.get("document_id", "")
+                if per_doc.get(did, 0) >= MAX_PER_DOC:
+                    continue
+                per_doc[did] = per_doc.get(did, 0) + 1
+                capped.append(r)
+            results = capped
 
         final = results[offset:offset + limit]
         chat_log.info(f"Total after RRF+filter: {len(final)} chunks (from {len(results)} unique)")

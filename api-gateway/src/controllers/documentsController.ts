@@ -1,11 +1,15 @@
 import path from 'path';
 import fs from 'fs';
+import DepartmentMember from '../models/DepartmentMember';
 import { Request, Response, NextFunction } from 'express';
 import Document from '../models/Document';
+import DocumentShare from '../models/DocumentShare';
 import {
     buildDocumentFilter,
     canAccessDocument,
     canDeleteDocument,
+    loadUserDeptContext,
+    hasPermission,
 } from '../services/accessScope';
 import {
     annotateDuplicateCounts,
@@ -22,6 +26,7 @@ import { recordActivityFromReq } from '../services/activityLog';
 import {
     getAiDocument,
     getAiDocumentImages,
+    getDocumentExtractions,
     getDocumentJobStatus,
     getSimilarDocuments,
     isAiServiceEnabled,
@@ -33,7 +38,6 @@ import {
     updateAiDocumentSettings,
 } from '../services/aiServiceClient';
 import { PERMISSIONS } from '../types/permissions';
-import { hasPermission } from '../services/accessScope';
 import logger from '../utils/logger';
 
 const SORT_FIELDS: Record<string, string> = {
@@ -86,13 +90,32 @@ async function syncStatusFromAiDocument(
         doc.status = 'processing';
     }
 
-    // Relocate as soon as AI knows the type (filename never decides the folder)
+    // Relocate only after AI finishes (or fails) so we never move the file mid-OCR/pipeline
     if (aiDoc.document_type) {
         doc.classification = String(aiDoc.document_type);
         try {
-            await applyDocumentTypeStorage(doc, String(aiDoc.document_type));
+            const { applyDocumentVisibilityScope } = await import('../services/documentVisibility');
+            await applyDocumentVisibilityScope(doc, String(aiDoc.document_type));
         } catch (e: any) {
-            logger.warn(`Storage relocate failed for ${doc.documentId}: ${e.message}`);
+            logger.warn(`Visibility scope failed for ${doc.documentId}: ${e.message}`);
+        }
+        const pipelineSettled =
+            PYTHON_DONE_STATUSES.some((s) => pyStatus.includes(s)) ||
+            PYTHON_FAILED_STATUSES.some((s) => pyStatus.includes(s));
+        if (pipelineSettled) {
+            try {
+                const moved = await applyDocumentTypeStorage(doc, String(aiDoc.document_type));
+                if (moved && doc.pythonDocumentId && fs.existsSync(doc.storagePath)) {
+                    const { updateAiDocumentFilePath } = await import('../services/aiServiceClient');
+                    await updateAiDocumentFilePath({
+                        pythonDocumentId: doc.pythonDocumentId,
+                        organizationId: aiOrgId,
+                        filePath: doc.storagePath,
+                    });
+                }
+            } catch (e: any) {
+                logger.warn(`Storage relocate failed for ${doc.documentId}: ${e.message}`);
+            }
         }
     }
 
@@ -119,6 +142,13 @@ export const listDocuments = async (req: Request, res: Response, next: NextFunct
         const organizationId = (req.query.organizationId as string) || undefined;
         const duplicatesOnly = (req.query.duplicatesOnly as string) === 'true';
         const scoreFilter = ((req.query.scoreFilter as string) || '').trim();
+        const departmentId = ((req.query.departmentId as string) || '').trim() || undefined;
+        const scopeRaw = ((req.query.scope as string) || '').trim();
+        const scope =
+            scopeRaw === 'personal' || scopeRaw === 'department' || scopeRaw === 'all'
+                ? scopeRaw
+                : undefined;
+        const classification = ((req.query.classification as string) || (req.query.documentType as string) || '').trim() || undefined;
 
         const extra: Record<string, unknown> = {};
         if (status) extra.status = status;
@@ -140,7 +170,37 @@ export const listDocuments = async (req: Request, res: Response, next: NextFunct
             extra['metadata.cvScore'] = { $exists: true, $ne: null };
         }
 
-        const baseFilter = buildDocumentFilter(req.user, extra, { organizationId });
+        // If querying by departmentId, expand results for admins and leaders to include documents
+        // uploaded by any member of the department (so admins/leaders see member uploads).
+        if (departmentId) {
+            try {
+                const members = await DepartmentMember.find({ departmentId }).select('userId').lean();
+                const memberIds = members.map((m) => m.userId).filter(Boolean);
+                const isAdminView =
+                    req.user.role === 'superAdmin' ||
+                    (req.user.role === 'admin' && hasPermission(req.user, PERMISSIONS.ORG_DOCUMENTS_VIEW));
+                let isLeaderView = false;
+                if (req.user.role === 'team') {
+                    const ctx = await loadUserDeptContext(req.user);
+                    isLeaderView = ctx.isLeader && ctx.departmentId === departmentId;
+                }
+                if (isAdminView || isLeaderView) {
+                    extra.$or = [
+                        ...(extra.$or as any[] || []),
+                        { uploadedBy: { $in: memberIds } },
+                    ];
+                }
+            } catch (e: any) {
+                // ignore member expand on error
+            }
+        }
+
+        const baseFilter = await buildDocumentFilter(req.user, extra, {
+            organizationId,
+            departmentId,
+            scope,
+            classification,
+        });
         let filter = baseFilter;
 
         if (duplicatesOnly) {
@@ -167,10 +227,27 @@ export const listDocuments = async (req: Request, res: Response, next: NextFunct
             getDuplicateGroupSizes(baseFilter),
         ]);
 
+        const documentIds = documents.map((doc) => doc.documentId).filter(Boolean);
+        const departmentIdQuery = (req.query.departmentId as string) || undefined;
+        const sharedDocs = documentIds.length
+            ? await DocumentShare.find({
+                  documentId: { $in: documentIds },
+                  scope: 'department',
+                  ...(departmentIdQuery ? { departmentId: departmentIdQuery } : {}),
+              })
+                  .select('documentId')
+                  .lean()
+            : [];
+        const sharedDocumentSet = new Set(sharedDocs.map((share) => share.documentId));
+        const documentsWithShareStatus = documents.map((doc) => ({
+            ...doc,
+            sharedToDepartment: Boolean(doc.documentId && sharedDocumentSet.has(doc.documentId)),
+        }));
+
         res.json({
             success: true,
             data: {
-                documents: annotateDuplicateCounts(documents, duplicateSizes),
+                documents: annotateDuplicateCounts(documentsWithShareStatus, duplicateSizes),
                 pagination: {
                     page,
                     limit,
@@ -193,7 +270,7 @@ export const getDocument = async (req: Request, res: Response, next: NextFunctio
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
         res.json({ success: true, data: { document: doc } });
@@ -214,7 +291,7 @@ export const streamDocument = (disposition: 'inline' | 'attachment') =>
             if (!doc) {
                 return res.status(404).json({ success: false, message: 'Document not found' });
             }
-            if (!canAccessDocument(req.user, doc)) {
+            if (!(await canAccessDocument(req.user, doc))) {
                 return res.status(403).json({ success: false, message: 'Forbidden' });
             }
             if (!fs.existsSync(doc.storagePath)) {
@@ -355,7 +432,7 @@ export const getDocumentProcessing = async (req: Request, res: Response, next: N
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
 
@@ -430,7 +507,7 @@ export const updateDocumentAiSettings = async (req: Request, res: Response, next
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
         if (!doc.pythonDocumentId) {
@@ -456,7 +533,15 @@ export const updateDocumentAiSettings = async (req: Request, res: Response, next
             phase3Agent: String(phase3Agent),
         };
         try {
-            await applyDocumentTypeStorage(doc, String(documentType));
+            const moved = await applyDocumentTypeStorage(doc, String(documentType));
+            if (moved && doc.pythonDocumentId && fs.existsSync(doc.storagePath)) {
+                const { updateAiDocumentFilePath } = await import('../services/aiServiceClient');
+                await updateAiDocumentFilePath({
+                    pythonDocumentId: doc.pythonDocumentId,
+                    organizationId: orgId,
+                    filePath: doc.storagePath,
+                });
+            }
         } catch (e: any) {
             logger.warn(`Storage relocate failed for ${doc.documentId}: ${e?.message || e}`);
         }
@@ -480,7 +565,7 @@ export const getDocumentIntelligence = async (req: Request, res: Response, next:
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
 
@@ -493,12 +578,16 @@ export const getDocumentIntelligence = async (req: Request, res: Response, next:
             const synced = await syncStatusFromAiDocument(doc, orgId, req.user);
             await doc.save();
             aiDocument = synced;
-            [job, validations] = await Promise.all([
+            const [extractions, jobResult, validationResult] = await Promise.all([
+                getDocumentExtractions(doc.pythonDocumentId, orgId),
                 getDocumentJobStatus(doc.pythonDocumentId, orgId),
-                doc.status === 'ready'
-                    ? listAiValidations(orgId, doc.pythonDocumentId)
-                    : Promise.resolve([]),
+                doc.status === 'ready' ? listAiValidations(orgId, doc.pythonDocumentId) : Promise.resolve([]),
             ]);
+            if (Array.isArray(extractions) && extractions.length > 0) {
+                aiDocument = { ...(aiDocument || {}), extractions };
+            }
+            job = jobResult;
+            validations = validationResult;
         }
 
         res.json({
@@ -521,7 +610,7 @@ export const listAllDocumentIntelligence = async (req: Request, res: Response, n
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
 
-        const filter = buildDocumentFilter(req.user, {});
+        const filter = await buildDocumentFilter(req.user, {});
         const docs = await Document.find(filter).sort({ createdAt: -1 }).limit(100);
 
         const documents = await Promise.all(
@@ -574,7 +663,7 @@ export const getDocumentImages = async (req: Request, res: Response, next: NextF
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
         if (!doc.pythonDocumentId) {
@@ -606,7 +695,7 @@ export const getDocumentSimilar = async (req: Request, res: Response, next: Next
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
         if (!doc.pythonDocumentId) {
@@ -635,7 +724,7 @@ export const streamDocumentAiFile = async (req: Request, res: Response, next: Ne
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
 
@@ -668,7 +757,7 @@ export const reprocessDocument = async (req: Request, res: Response, next: NextF
         if (!doc) {
             return res.status(404).json({ success: false, message: 'Document not found' });
         }
-        if (!canAccessDocument(req.user, doc)) {
+        if (!(await canAccessDocument(req.user, doc))) {
             return res.status(403).json({ success: false, message: 'Forbidden' });
         }
         if (!doc.pythonDocumentId) {
@@ -676,10 +765,24 @@ export const reprocessDocument = async (req: Request, res: Response, next: NextF
         }
 
         const orgId = resolveDocumentAiOrgId(doc, req.user);
+        if (!doc.storagePath || !fs.existsSync(doc.storagePath)) {
+            return res.status(404).json({
+                success: false,
+                message:
+                    'Original file is missing from storage. Please delete this entry and re-upload the document.',
+            });
+        }
+
         doc.status = 'processing';
         doc.aiErrorMessage = null;
         await doc.save();
 
+        const { updateAiDocumentFilePath } = await import('../services/aiServiceClient');
+        await updateAiDocumentFilePath({
+            pythonDocumentId: doc.pythonDocumentId,
+            organizationId: orgId,
+            filePath: doc.storagePath,
+        });
         await triggerDocumentReprocess(doc.pythonDocumentId, orgId);
 
         res.json({

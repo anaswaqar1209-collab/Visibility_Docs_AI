@@ -18,11 +18,12 @@ export function enrichUserFromToken(user: any, token: string | null) {
 }
 
 export function getRedirectPath(_accountType?: string, role?: string) {
-    if (role === "superAdmin") return "/documents";
+    if (role === "superAdmin") return "/admin/documents";
     return "/documents";
 }
 
-export async function resolvePostLoginPath(_user: any) {
+export async function resolvePostLoginPath(user: any) {
+    if (user?.role === "superAdmin") return "/admin/documents";
     return "/documents";
 }
 

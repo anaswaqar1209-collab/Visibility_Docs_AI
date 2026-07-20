@@ -33,9 +33,15 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     organization_id TEXT NOT NULL,
     document_id TEXT NOT NULL,
     page_id TEXT,
+    chunk_index INTEGER DEFAULT 0,
     chunk_type TEXT DEFAULT 'paragraph',
     heading TEXT,
+    section TEXT,
+    section_number TEXT,
+    machine_id TEXT,
+    filename TEXT,
     content TEXT NOT NULL,
+    chunk_text TEXT,
     metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT now()
 );
@@ -66,6 +72,13 @@ CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(document_type);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_document_id ON document_embeddings(document_id);
+
+-- Migrate missing columns (safe to re-run)
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS section TEXT;
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS section_number TEXT;
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS machine_id TEXT;
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS filename TEXT;
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS chunk_text TEXT;
 
 CREATE TABLE IF NOT EXISTS documents_metadata (
     id SERIAL PRIMARY KEY,

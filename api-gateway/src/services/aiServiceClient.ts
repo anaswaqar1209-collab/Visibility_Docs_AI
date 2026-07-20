@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger';
 
-const BASE_URL = (process.env.AI_SERVICE_URL || 'http://localhost:8000').replace(/\/$/, '');
+const BASE_URL = (process.env.AI_SERVICE_URL || 'http://localhost:8001').replace(/\/$/, '');
 const TIMEOUT = parseInt(process.env.AI_SERVICE_TIMEOUT_MS || '120000', 10);
 const ENABLED = process.env.AI_SERVICE_ENABLED !== 'false';
 
@@ -253,6 +253,24 @@ export async function updateAiDocumentSettings(params: {
     return res.data as Record<string, unknown>;
 }
 
+/** Keep AI original_file_url in sync after gateway relocates the file on disk. */
+export async function updateAiDocumentFilePath(params: {
+    pythonDocumentId: string;
+    organizationId: string;
+    filePath: string;
+}): Promise<void> {
+    if (!ENABLED || !params.pythonDocumentId || !params.filePath) return;
+
+    const res = await client().patch(`/api/v1/documents/${params.pythonDocumentId}`, {
+        organization_id: params.organizationId,
+        original_file_url: path.resolve(params.filePath),
+    });
+    if (res.status >= 400) {
+        const detail = res.data?.detail || res.data?.message || JSON.stringify(res.data);
+        throw new Error(`AI file path update failed (${res.status}): ${detail}`);
+    }
+}
+
 export type AiDocumentImages = {
     images: Array<{ page?: number; image_path?: string; description?: string }>;
     descriptions_file?: string;
@@ -269,6 +287,35 @@ export async function getAiDocumentImages(
     });
     if (res.status >= 400) return null;
     return res.data as AiDocumentImages;
+}
+
+export type AiDocumentExtraction = {
+    id?: number;
+    organization_id?: string;
+    document_id: string;
+    extraction_type: string;
+    extracted_data: Record<string, unknown>;
+    confidence?: number;
+    reviewed?: number;
+    created_at?: string;
+};
+
+export async function getDocumentExtractions(
+    pythonDocumentId: string,
+    organizationId: string,
+    extractionType?: string
+): Promise<AiDocumentExtraction[]> {
+    if (!ENABLED || !pythonDocumentId) return [];
+
+    const params: Record<string, string> = { organization_id: organizationId };
+    if (extractionType) params.extraction_type = extractionType;
+    const res = await client().get(`/api/v1/documents/${pythonDocumentId}/extractions`, {
+        params,
+    });
+    if (res.status >= 400) return [];
+    const data = res.data;
+    if (Array.isArray(data?.extractions)) return data.extractions as AiDocumentExtraction[];
+    return [];
 }
 
 export type AiSimilarDocument = {

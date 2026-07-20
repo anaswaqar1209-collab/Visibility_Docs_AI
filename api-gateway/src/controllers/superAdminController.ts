@@ -9,6 +9,14 @@ import {
 } from '../services/duplicateDetection';
 import { recordActivityFromReq } from '../services/activityLog';
 
+const SORT_FIELDS: Record<string, string> = {
+    createdAt: 'createdAt',
+    name: 'originalFilename',
+    size: 'sizeBytes',
+    status: 'status',
+    score: 'metadata.cvScore',
+};
+
 export const listAdmins = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const admins = await User.find({ role: 'admin' })
@@ -156,18 +164,35 @@ export const listAllDocuments = async (req: Request, res: Response, next: NextFu
         const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
         const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || '20', 10)));
         const q = ((req.query.q as string) || '').trim();
+        const sortBy = SORT_FIELDS[(req.query.sortBy as string) || 'createdAt'] || 'createdAt';
+        const sortOrder = (req.query.sortOrder as string) === 'asc' ? 1 : -1;
+        const status = (req.query.status as string) || '';
         const mimeType = (req.query.mimeType as string) || '';
+        const organizationId = (req.query.organizationId as string) || undefined;
         const duplicatesOnly = (req.query.duplicatesOnly as string) === 'true';
+        const scoreFilter = ((req.query.scoreFilter as string) || '').trim();
+
         const filter: Record<string, unknown> = {};
-        if (req.query.organizationId) filter.organizationId = req.query.organizationId;
+        if (organizationId) filter.organizationId = organizationId;
+        if (status) filter.status = status;
         if (mimeType) {
             filter.mimeType = new RegExp(mimeType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
         }
         if (q) {
             filter.$or = [
                 { originalFilename: { $regex: q, $options: 'i' } },
+                { classification: { $regex: q, $options: 'i' } },
                 { documentId: { $regex: q, $options: 'i' } },
             ];
+        }
+        if (scoreFilter === 'high') {
+            filter['metadata.cvScore'] = { $gte: 70 };
+        } else if (scoreFilter === 'medium') {
+            filter['metadata.cvScore'] = { $gte: 40, $lt: 70 };
+        } else if (scoreFilter === 'low') {
+            filter['metadata.cvScore'] = { $gte: 0, $lt: 40 };
+        } else if (scoreFilter === 'scored') {
+            filter['metadata.cvScore'] = { $exists: true, $ne: null };
         }
 
         let queryFilter = filter;
@@ -186,7 +211,11 @@ export const listAllDocuments = async (req: Request, res: Response, next: NextFu
         }
 
         const [documents, total, duplicateSizes] = await Promise.all([
-            Document.find(queryFilter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+            Document.find(queryFilter)
+                .sort({ [sortBy]: sortOrder })
+                .skip((page - 1) * limit)
+                .limit(limit)
+                .lean(),
             Document.countDocuments(queryFilter),
             getDuplicateGroupSizes(filter),
         ]);

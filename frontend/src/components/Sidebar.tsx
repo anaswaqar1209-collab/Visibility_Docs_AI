@@ -10,15 +10,17 @@ import {
     LogOut,
     Moon,
     Sun,
-    Users,
     Shield,
     FolderOpen,
     Activity,
     X,
+    Building2,
+    ChevronDown,
 } from "lucide-react";
 import { useTheme } from "@/context/ColorContext";
 import { usePermissions } from "@/context/PermissionsContext";
 import { clearAuthState, getStoredUser } from "@/lib/authSession";
+import { apiRequest } from "@/lib/apiClient";
 import SiteLogo from "@/assets/Logo/Logo Visibility Live_pixian_ai.png";
 import { cn } from "@/lib/utils";
 
@@ -28,6 +30,8 @@ type StoredUser = {
     username?: string;
     role?: string;
 };
+
+type DeptNav = { departmentId: string; name: string };
 
 type SidebarProps = {
     open?: boolean;
@@ -41,8 +45,33 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
     const colors = theme.colors;
     const isDark = theme.name === "dark";
     const user = getStoredUser<StoredUser>();
-    const { role: permRole, canChat, canUpload, canViewDocs } = usePermissions();
+    const { role: permRole, canChat, canUpload, canViewDocs, hasPermission } = usePermissions();
     const role = permRole || user?.role || "team";
+
+    const [deptOpen, setDeptOpen] = React.useState(true);
+    const [departments, setDepartments] = React.useState<DeptNav[]>([]);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await apiRequest("/docs/departments");
+                if (!cancelled) setDepartments(res?.data?.departments || []);
+            } catch {
+                if (!cancelled) setDepartments([]);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [role]);
+
+    const isSuperAdmin = role === "superAdmin";
+    const canSeeDepts =
+        role === "admin" ||
+        isSuperAdmin ||
+        hasPermission("department.view") ||
+        hasPermission("department.manage");
 
     const nav: {
         href: string;
@@ -59,11 +88,10 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
             allow: () => canViewDocs() || canUpload() || role === "admin" || role === "superAdmin",
         },
         {
-            href: "/chat",
-            label: "AI Chat",
-            icon: MessageSquare,
-            roles: ["superAdmin", "admin", "team", "service_account"],
-            allow: () => canChat(),
+            href: "/admin/documents",
+            label: "All Documents",
+            icon: FolderOpen,
+            roles: ["superAdmin"],
         },
         {
             href: "/activity",
@@ -71,12 +99,28 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
             icon: Activity,
             roles: ["superAdmin", "admin", "team"],
         },
-        { href: "/team", label: "Team", icon: Users, roles: ["admin"] },
         { href: "/admin/admins", label: "Admins", icon: Shield, roles: ["superAdmin"] },
-        { href: "/admin/documents", label: "All Documents", icon: FolderOpen, roles: ["superAdmin"] },
+        {
+            href: "/chat",
+            label: "AI Chat",
+            icon: MessageSquare,
+            roles: ["superAdmin", "admin", "team", "service_account"],
+            allow: () => canChat(),
+        },
+        {
+            href: "/admin/departments",
+            label: "Departments",
+            icon: Building2,
+            roles: ["admin", "superAdmin"],
+            allow: () => role === "admin" || role === "superAdmin" || hasPermission("department.manage"),
+        },
     ];
 
-    const visibleNav = nav.filter((n) => n.roles.includes(role) && (n.allow ? n.allow() : true));
+    const visibleNav = nav
+        .filter((n) => n.roles.includes(role) && (n.allow ? n.allow() : true))
+        .filter((n) =>
+            !isSuperAdmin || ["/admin/documents", "/chat", "/activity", "/admin/admins"].includes(n.href)
+        );
 
     const logout = () => {
         clearAuthState();
@@ -109,7 +153,6 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
                 className={cn(
                     "w-64 h-full border-r border-[var(--border)] app-sidebar flex flex-col overflow-hidden",
                     "shadow-[4px_0_24px_rgba(0,0,0,0.2)] relative",
-                    // Mobile: off-canvas; Desktop: in-flow rail
                     "fixed inset-y-0 left-0 z-50 transition-transform duration-200 ease-out",
                     "lg:static lg:z-10 lg:translate-x-0 lg:shrink-0",
                     open ? "translate-x-0" : "-translate-x-full"
@@ -141,24 +184,66 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
                 <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto relative z-[1]">
                     {visibleNav.map(({ href, label, icon: Icon }) => {
                         const active = pathname === href || pathname?.startsWith(`${href}/`);
+                        const showDeptDropdown = href === "/documents" && canSeeDepts && departments.length > 0;
                         return (
-                            <Link
-                                key={href}
-                                href={href}
-                                onClick={() => onClose?.()}
-                                className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 min-h-11 ${
-                                    active ? colors.sidebarItemActive : colors.sidebarItemInactive
-                                }`}
-                            >
-                                <span
-                                    className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 ${
-                                        active ? colors.sidebarIconBgActive : colors.sidebarIconBgInactive
-                                    }`}
-                                >
-                                    <Icon size={15} />
-                                </span>
-                                {label}
-                            </Link>
+                            <div key={href}>
+                                <div className="flex items-center gap-1">
+                                    <Link
+                                        href={href}
+                                        onClick={() => onClose?.()}
+                                        className={`flex-1 flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 min-h-11 ${
+                                            active && !pathname?.startsWith("/departments/")
+                                                ? colors.sidebarItemActive
+                                                : colors.sidebarItemInactive
+                                        }`}
+                                    >
+                                        <span
+                                            className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 ${
+                                                active && !pathname?.startsWith("/departments/")
+                                                    ? colors.sidebarIconBgActive
+                                                    : colors.sidebarIconBgInactive
+                                            }`}
+                                        >
+                                            <Icon size={15} />
+                                        </span>
+                                        {label}
+                                    </Link>
+                                    {showDeptDropdown && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setDeptOpen((o) => !o)}
+                                            className="p-2 rounded-lg min-h-11 min-w-11 flex items-center justify-center"
+                                            style={{ color: "var(--foreground-muted)" }}
+                                            aria-label="Toggle departments"
+                                        >
+                                            <ChevronDown
+                                                size={16}
+                                                className={cn("transition-transform", deptOpen ? "rotate-180" : "")}
+                                            />
+                                        </button>
+                                    )}
+                                </div>
+                                {showDeptDropdown && deptOpen && (
+                                    <div className="ml-4 pl-3 border-l border-[var(--border)] space-y-0.5 mb-1">
+                                        {departments.map((d) => {
+                                            const dActive = pathname === `/departments/${d.departmentId}`;
+                                            return (
+                                                <Link
+                                                    key={d.departmentId}
+                                                    href={`/departments/${d.departmentId}`}
+                                                    onClick={() => onClose?.()}
+                                                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium min-h-9 ${
+                                                        dActive ? colors.sidebarItemActive : colors.sidebarItemInactive
+                                                    }`}
+                                                >
+                                                    <Building2 size={12} className="shrink-0 opacity-70" />
+                                                    <span className="truncate">{d.name}</span>
+                                                </Link>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
                         );
                     })}
                 </nav>

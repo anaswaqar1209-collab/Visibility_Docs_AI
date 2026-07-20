@@ -45,7 +45,7 @@ export const searchDocuments = async (req: Request, res: Response, next: NextFun
 
             const pythonIds = [...new Set(result.results.map((r) => r.document_id).filter(Boolean))];
             const nodeDocs = await Document.find(
-                buildDocumentFilter(req.user, { pythonDocumentId: { $in: pythonIds } })
+                await buildDocumentFilter(req.user, { pythonDocumentId: { $in: pythonIds } })
             ).lean();
             const pythonToNode = new Map(
                 nodeDocs.filter((d) => d.pythonDocumentId).map((d) => [d.pythonDocumentId as string, d])

@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from ..config import settings
 from ..database import SupabaseDB
-from ..models.schemas import UploadResponse, DocumentListResponse, ProcessResponse
+from ..models.schemas import UploadResponse, DocumentListResponse, ProcessResponse, ExtractionListResponse
 from ..services.document_service import document_service
 from ..utils.file_utils import (
     save_upload_file,
@@ -305,24 +305,65 @@ async def get_document(document_id: str, organization_id: str = ""):
     return doc
 
 
+@router.get(
+    "/{document_id}/extractions",
+    response_model=ExtractionListResponse,
+    summary="List document extractions",
+    description="Return document extraction records, optionally filtered by extraction_type.",
+)
+async def get_document_extractions(document_id: str, organization_id: str = "", extraction_type: str = ""):
+    filters = {"document_id": document_id}
+    if organization_id:
+        filters["organization_id"] = organization_id
+    if extraction_type:
+        filters["extraction_type"] = extraction_type
+    result = SupabaseDB.select("document_extractions", filters=filters)
+    data = getattr(result, "data", result if isinstance(result, list) else [])
+    if not isinstance(data, list):
+        data = []
+
+    normalized = []
+    for row in data:
+        if isinstance(row, dict):
+            extracted_data = row.get("extracted_data", {})
+            if isinstance(extracted_data, str):
+                try:
+                    import json
+                    extracted_data = json.loads(extracted_data)
+                except Exception:
+                    extracted_data = {}
+            normalized.append({**row, "extracted_data": extracted_data})
+        else:
+            normalized.append(row)
+
+    return {"extractions": normalized, "total": len(normalized)}
+
+
 class UpdateDocTypeRequest(BaseModel):
-    document_type: str = Field(..., description="Document type (invoice, contract, etc.)")
+    document_type: str | None = Field(None, description="Document type (invoice, contract, etc.)")
     phase3_agent: str = Field("", description="Phase 3 agent to use for extraction")
     organization_id: str = Field(..., description="Tenant ID")
+    original_file_url: str | None = Field(None, description="Updated local file path after storage relocate")
 
 
 @router.patch(
     "/{document_id}",
     summary="Update document metadata",
-    description="Update document type and phase3 agent for extraction",
+    description="Update document type, phase3 agent, and/or file path after storage relocate",
 )
 async def update_document(document_id: str, body: UpdateDocTypeRequest):
     from ..database import SupabaseDB
-    updates = {"document_type": body.document_type}
+    updates = {}
+    if body.document_type:
+        updates["document_type"] = body.document_type
     if body.phase3_agent:
         updates["phase3_agent"] = body.phase3_agent
+    if body.original_file_url:
+        updates["original_file_url"] = body.original_file_url.strip()
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
     SupabaseDB.update("documents", updates, "id", document_id)
-    return {"id": document_id, "document_type": body.document_type, "phase3_agent": body.phase3_agent, "status": "updated"}
+    return {"id": document_id, **updates, "status": "updated"}
 
 
 @router.get(
@@ -489,6 +530,70 @@ async def classify_text(request: ClassifyTextRequest = Body(...)):
     from ..services.classification_service import classification_service
     result = classification_service.classify(request.text, request.filename)
     return result
+
+
+@router.post(
+    "/reindex-all",
+    summary="Re-index all documents with current RAG logic",
+    description="Delete existing chunks/embeddings and re-index every document using the latest heading detection and chunking.",
+)
+async def reindex_all():
+    from ..services.rag_service import rag_service as rag
+    from ..database import _get_supabase
+    from ..services.pinecone_service import pinecone_service
+
+    print("\n" + "="*70)
+    print("[REINDEX] Starting full re-index of all documents...")
+    print("="*70)
+
+    client = _get_supabase()
+    if not client:
+        raise HTTPException(status_code=500, detail="Supabase client unavailable")
+    res = client.table("documents").select(
+        "id, organization_id, raw_text, document_type, status"
+    ).execute()
+    docs = getattr(res, "data", []) or []
+    print(f"[REINDEX] Found {len(docs)} documents in DB")
+
+    results = {"total": len(docs), "reindexed": 0, "skipped": 0, "errors": []}
+
+    for d in docs:
+        doc_id = d.get("id")
+        org_id = d.get("organization_id")
+        raw_text = d.get("raw_text") or ""
+        doc_type = d.get("document_type")
+        if not doc_id or not org_id or not raw_text.strip():
+            results["skipped"] += 1
+            print(f"[REINDEX] SKIP doc={doc_id} (no org/raw_text)")
+            continue
+
+        print(f"\n[REINDEX] ({results['reindexed'] + 1}/{len(docs)}) doc={doc_id[:12]} type={doc_type} chars={len(raw_text)}")
+
+        try:
+            # Delete old chunks
+            if pinecone_service.available:
+                try:
+                    pinecone_service.delete_by_document(doc_id, namespace=org_id)
+                except Exception as e:
+                    print(f"  [WARN] Pinecone delete: {e}")
+            client.table("document_chunks").delete().eq("document_id", doc_id).execute()
+            client.table("document_embeddings").delete().eq("document_id", doc_id).execute()
+
+            # Re-index with current logic
+            rag.index_document(
+                doc_id, org_id, raw_text, None,
+                document_type=doc_type,
+            )
+            results["reindexed"] += 1
+        except Exception as e:
+            import traceback as _tb
+            tb = _tb.format_exc()
+            print(f"  [ERROR] {e}\n{tb}")
+            results["errors"].append({"doc_id": doc_id, "error": str(e)})
+            results["skipped"] += 1
+
+    print(f"\n[REINDEX] DONE: {results['reindexed']} reindexed, {results['skipped']} skipped, {len(results['errors'])} errors")
+    return results
 
 
 

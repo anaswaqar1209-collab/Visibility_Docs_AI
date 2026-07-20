@@ -51,7 +51,7 @@ export const chatWithDocuments = async (req: Request, res: Response, next: NextF
             });
         }
 
-        const filter = buildDocumentFilter(req.user, {});
+        const filter = await buildDocumentFilter(req.user, {});
         const docs = await Document.find(filter).sort({ createdAt: -1 }).limit(100).lean();
 
         if (!docs.length && !isChitchat) {

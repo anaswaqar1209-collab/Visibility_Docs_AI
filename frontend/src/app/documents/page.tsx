@@ -27,6 +27,9 @@ type DocItem = {
     sizeBytes: number;
     status: string;
     classification?: string | null;
+    visibilityScope?: "personal" | "department" | null;
+    departmentId?: string | null;
+    uploaderIsLeader?: boolean;
     createdAt: string;
     duplicateCount?: number;
     isDuplicate?: boolean;
@@ -74,7 +77,7 @@ function formatBytes(n: number) {
     return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function statusBadge(status: string, _isDark: boolean) {
+function statusBadge(status: string) {
     const s = status.toLowerCase();
     if (s === "ready" || s === "processed" || s === "completed" || s === "complete" || s === "done") {
         return "bg-[var(--success-muted)] text-[var(--success)] border-[rgba(52,211,153,0.25)]";
@@ -90,16 +93,16 @@ function statusBadge(status: string, _isDark: boolean) {
 
 const IN_PROGRESS_AI = ["queued", "running", "processing", "ocr", "classify", "extract", "embed", "uploaded", "pending"];
 
-function getDisplayStatus(doc: DocItem): { label: string; isProcessing: boolean; subtitle?: string } {
+function getDisplayStatus(doc: DocItem): { label: string; isProcessing: boolean; subtitle?: string; isComplete: boolean } {
     if (doc.status === "failed" || (doc.aiErrorMessage && !doc.pythonDocumentId)) {
-        return { label: "Failed", isProcessing: false };
+        return { label: "Failed", isProcessing: false, isComplete: false };
     }
     if (doc.status === "ready") {
-        return { label: "Complete", isProcessing: false };
+        return { label: "Complete", isProcessing: false, isComplete: true };
     }
     const ai = (doc.aiProcessingStatus || "").toLowerCase();
     if (ai.includes("fail")) {
-        return { label: "Failed", isProcessing: false, subtitle: doc.aiProcessingStatus || undefined };
+        return { label: "Failed", isProcessing: false, subtitle: doc.aiProcessingStatus || undefined, isComplete: false };
     }
     if (doc.status === "processing" || doc.status === "uploaded") {
         const inProgress = !ai || IN_PROGRESS_AI.some((s) => ai.includes(s));
@@ -108,13 +111,14 @@ function getDisplayStatus(doc: DocItem): { label: string; isProcessing: boolean;
                 label: "Processing",
                 isProcessing: true,
                 subtitle: doc.aiProcessingStatus && doc.aiProcessingStatus !== "processing" ? doc.aiProcessingStatus : undefined,
+                isComplete: false,
             };
         }
     }
     if (doc.status === "uploaded") {
-        return { label: "Uploaded", isProcessing: false };
+        return { label: "Uploaded", isProcessing: false, isComplete: false };
     }
-    return { label: doc.status, isProcessing: doc.status === "processing" };
+    return { label: doc.status, isProcessing: doc.status === "processing", isComplete: false };
 }
 
 type ClassifyQueueItem = {
@@ -145,6 +149,8 @@ function DocumentsContent() {
     const [searchInput, setSearchInput] = useState("");
     const [sortPreset, setSortPreset] = useState<string>("newest");
     const [scoreFilter, setScoreFilter] = useState("");
+    const [scopeFilter, setScopeFilter] = useState("");
+    const [typeFilter, setTypeFilter] = useState("");
     const [page, setPage] = useState(1);
     const [pageLimit, setPageLimit] = useState(10);
     const [agentFilter, setAgentFilter] = useState("");
@@ -172,6 +178,8 @@ function DocumentsContent() {
             });
             if (q) params.set("q", q);
             if (scoreFilter) params.set("scoreFilter", scoreFilter);
+            if (scopeFilter) params.set("scope", scopeFilter);
+            if (typeFilter) params.set("classification", typeFilter);
             const data = await apiRequest(`/docs/documents?${params}`);
             setDocs(data?.data?.documents || []);
             setPagination(data?.data?.pagination || { page: 1, limit: 10, total: 0, totalPages: 0 });
@@ -180,7 +188,7 @@ function DocumentsContent() {
         } finally {
             setLoading(false);
         }
-    }, [page, pageLimit, q, activeSort.sortBy, activeSort.sortOrder, scoreFilter]);
+    }, [page, pageLimit, q, activeSort.sortBy, activeSort.sortOrder, scoreFilter, scopeFilter, typeFilter]);
 
     useEffect(() => { load(); }, [load]);
 
@@ -419,7 +427,7 @@ function DocumentsContent() {
     const allowView = canViewDocs();
     const allowDelete = canDeleteDocs();
     const showStaging = pendingFiles.length > 0 || queueItems.length > 0;
-    const hasActiveFilters = Boolean(scoreFilter || agentFilter || sortPreset !== "newest");
+    const hasActiveFilters = Boolean(scoreFilter || agentFilter || scopeFilter || typeFilter || sortPreset !== "newest");
 
     return (
         <div ref={containerRef} tabIndex={0} className="p-4 sm:p-6 lg:p-8 space-y-6 max-w-6xl mx-auto outline-none animate-fade-in-up">
@@ -581,7 +589,7 @@ function DocumentsContent() {
                                 </div>
                                 <div className="flex items-center gap-2">
                                     {"status" in item && item.status !== "queued" && (
-                                        <span className={`text-xs px-2 py-0.5 rounded-full border ${statusBadge(item.status, isDark)}`}>
+                                        <span className={`text-xs px-2 py-0.5 rounded-full border ${statusBadge(item.status)}`}>
                                             {item.status}
                                             {item.error ? `: ${item.error}` : ""}
                                         </span>
@@ -654,13 +662,40 @@ function DocumentsContent() {
                                 Filters
                                 {hasActiveFilters && (
                                     <span className="h-5 min-w-5 px-1 rounded-full bg-[var(--accent)] text-[#042f2e] text-[10px] font-bold flex items-center justify-center">
-                                        {[scoreFilter, agentFilter, sortPreset !== "newest"].filter(Boolean).length}
+                                        {[scoreFilter, agentFilter, scopeFilter, typeFilter, sortPreset !== "newest"].filter(Boolean).length}
                                     </span>
                                 )}
                             </button>
                         </div>
                         {filtersOpen && (
-                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1 animate-fade-in-up">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-1 animate-fade-in-up">
+                                <FilterSelect
+                                    label="Scope"
+                                    value={scopeFilter}
+                                    onChange={(v) => { setScopeFilter(v); setPage(1); }}
+                                    options={[
+                                        { value: "", label: "All scopes" },
+                                        { value: "department", label: "Department" },
+                                        { value: "personal", label: "Personal" },
+                                    ]}
+                                    minWidth="w-full"
+                                />
+                                <FilterSelect
+                                    label="Doc type"
+                                    value={typeFilter}
+                                    onChange={(v) => { setTypeFilter(v); setPage(1); }}
+                                    options={[
+                                        { value: "", label: "All types" },
+                                        { value: "resume", label: "Resume / CV" },
+                                        { value: "invoice", label: "Invoice" },
+                                        { value: "purchase_order", label: "Purchase order" },
+                                        { value: "contract", label: "Contract" },
+                                        { value: "quotation", label: "Quotation" },
+                                        { value: "hr_document", label: "HR document" },
+                                        { value: "other", label: "Other" },
+                                    ]}
+                                    minWidth="w-full"
+                                />
                                 <FilterSelect
                                     label="Score"
                                     value={scoreFilter}
@@ -685,7 +720,7 @@ function DocumentsContent() {
                             </div>
                         )}
                     </div>
-                    {(scoreFilter || agentFilter || sortPreset !== "newest" || q) && (
+                    {(scoreFilter || agentFilter || scopeFilter || typeFilter || sortPreset !== "newest" || q) && (
                         <div className="flex flex-wrap items-center gap-2 mt-3">
                             {q && (
                                 <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-300">
@@ -717,6 +752,8 @@ function DocumentsContent() {
                                     setSearchInput("");
                                     setQ("");
                                     setScoreFilter("");
+                                    setScopeFilter("");
+                                    setTypeFilter("");
                                     setAgentFilter("");
                                     setSortPreset("newest");
                                     setPage(1);
@@ -741,19 +778,35 @@ function DocumentsContent() {
                 ) : (
                     <ul className="divide-y divide-[var(--border)]">
                         {filteredDocs.map((doc) => {
-                            const { label: displayStatus, isProcessing } = getDisplayStatus(doc);
+                            const { label: displayStatus, isProcessing, isComplete } = getDisplayStatus(doc);
+                            const rowWarnClass = !isComplete ? 'border-l-4 border-red-500/20' : '';
                             return (
-                            <li key={doc.documentId} className={`px-4 sm:px-5 py-4 flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-3 ${colors.bgHover}`}>
+                            <li key={doc.documentId} className={`px-4 sm:px-5 py-4 flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-3 ${colors.bgHover} ${rowWarnClass}`}>
                                 <div className="min-w-0 flex-1">
                                     <div className="flex items-center gap-2 flex-wrap">
                                         <p className={`font-medium truncate min-w-0 ${colors.textPrimary}`}>{doc.originalFilename}</p>
-                                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase border ${statusBadge(displayStatus, isDark)}`}>
+                                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase border ${statusBadge(displayStatus)}`}>
                                             {isProcessing && <Loader2 size={10} className="animate-spin" />}
                                             {displayStatus}
                                         </span>
                                         {doc.isDuplicate && (
                                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-amber-500/15 text-amber-300 border border-amber-500/25">
                                                 <Copy size={10} /> Duplicate ×{doc.duplicateCount}
+                                            </span>
+                                        )}
+                                        {doc.visibilityScope === "department" && (
+                                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-[var(--accent-muted)] text-[var(--accent)] border border-[rgba(45,212,191,0.25)]">
+                                                Department
+                                            </span>
+                                        )}
+                                        {doc.visibilityScope === "personal" && (
+                                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-white/5 text-[var(--foreground-muted)] border border-[var(--border)]">
+                                                Personal
+                                            </span>
+                                        )}
+                                        {doc.uploaderIsLeader && (
+                                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-amber-500/15 text-amber-300 border border-amber-500/25">
+                                                Leader
                                             </span>
                                         )}
                                     </div>
@@ -764,17 +817,7 @@ function DocumentsContent() {
                                         {formatBytes(doc.sizeBytes)} · {new Date(doc.createdAt).toLocaleString()}
                                         {doc.classification && ` · ${doc.classification}`}
                                         {doc.metadata?.phase3Agent && ` · ${agentLabel(doc.metadata.phase3Agent)}`}
-                                        {doc.metadata?.cvScore != null && (
-                                            <span className={`ml-1 inline-flex px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                                                doc.metadata.cvScore >= 70
-                                                    ? "bg-green-500/15 text-green-300"
-                                                    : doc.metadata.cvScore >= 40
-                                                      ? "bg-amber-500/15 text-amber-300"
-                                                      : "bg-red-500/15 text-red-300"
-                                            }`}>
-                                                Score: {doc.metadata.cvScore}
-                                            </span>
-                                        )}
+                                            {/* Score moved to status position; no duplicate here */}
                                     </p>
                                     {doc.aiErrorMessage && (
                                         <p className="text-xs text-red-400 mt-1">{doc.aiErrorMessage}</p>

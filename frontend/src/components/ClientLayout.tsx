@@ -14,7 +14,7 @@ const PAGE_TITLES: Record<string, string> = {
     "/documents": "Documents",
     "/chat": "AI Chat",
     "/activity": "Activity",
-    "/team": "Team",
+    "/admin/departments": "Departments",
     "/admin/admins": "Admins",
     "/admin/documents": "All Documents",
 };
@@ -25,7 +25,8 @@ function resolvePageTitle(pathname: string | null): string {
     if (pathname.startsWith("/documents")) return "Documents";
     if (pathname.startsWith("/chat")) return "AI Chat";
     if (pathname.startsWith("/activity")) return "Activity";
-    if (pathname.startsWith("/team")) return "Team";
+    if (pathname.startsWith("/departments/")) return "Department";
+    if (pathname.startsWith("/admin/departments")) return "Departments";
     if (pathname.startsWith("/admin")) return "Admin";
     return "Docs AI";
 }
@@ -35,7 +36,7 @@ function Shell({ children }: { children: React.ReactNode }) {
     const colors = theme.colors;
     const router = useRouter();
     const pathname = usePathname();
-    const { ready, reload } = usePermissions();
+    const { ready, reload, role } = usePermissions();
     const [navOpen, setNavOpen] = useState(false);
 
     const closeNav = useCallback(() => setNavOpen(false), []);
@@ -51,6 +52,18 @@ function Shell({ children }: { children: React.ReactNode }) {
     useEffect(() => {
         if (ready) reload();
     }, [pathname, ready, reload]);
+
+    useEffect(() => {
+        if (ready && role === "superAdmin" && pathname) {
+            const allowedRoutes = ["/admin/documents", "/chat", "/activity", "/admin/admins"];
+            const isAllowed = allowedRoutes.some(
+                (route) => pathname === route || pathname.startsWith(`${route}/`)
+            );
+            if (!isAllowed) {
+                router.replace("/admin/documents");
+            }
+        }
+    }, [ready, role, pathname, router]);
 
     useEffect(() => {
         setNavOpen(false);

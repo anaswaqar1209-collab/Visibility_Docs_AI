@@ -3,9 +3,12 @@ export const PERMISSIONS = {
     DOCUMENT_VIEW: 'document.view',
     DOCUMENT_DELETE: 'document.delete',
     DOCUMENT_PREVIEW: 'document.preview',
+    DOCUMENT_SHARE: 'document.share',
     CHAT_USE: 'chat.use',
     TEAM_MANAGE: 'team.manage',
     ORG_DOCUMENTS_VIEW: 'org.documents.view',
+    DEPARTMENT_MANAGE: 'department.manage',
+    DEPARTMENT_VIEW: 'department.view',
 } as const;
 
 export type PermissionKey = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];
@@ -15,9 +18,12 @@ export const DEFAULT_TEAM_PERMISSIONS: Record<PermissionKey, boolean> = {
     [PERMISSIONS.DOCUMENT_VIEW]: true,
     [PERMISSIONS.DOCUMENT_DELETE]: true,
     [PERMISSIONS.DOCUMENT_PREVIEW]: true,
+    [PERMISSIONS.DOCUMENT_SHARE]: false,
     [PERMISSIONS.CHAT_USE]: true,
     [PERMISSIONS.TEAM_MANAGE]: false,
     [PERMISSIONS.ORG_DOCUMENTS_VIEW]: false,
+    [PERMISSIONS.DEPARTMENT_MANAGE]: false,
+    [PERMISSIONS.DEPARTMENT_VIEW]: true,
 };
 
 export const DEFAULT_ADMIN_PERMISSIONS: Record<PermissionKey, boolean> = {
@@ -25,9 +31,34 @@ export const DEFAULT_ADMIN_PERMISSIONS: Record<PermissionKey, boolean> = {
     [PERMISSIONS.DOCUMENT_VIEW]: true,
     [PERMISSIONS.DOCUMENT_DELETE]: true,
     [PERMISSIONS.DOCUMENT_PREVIEW]: true,
+    [PERMISSIONS.DOCUMENT_SHARE]: true,
     [PERMISSIONS.CHAT_USE]: true,
     [PERMISSIONS.TEAM_MANAGE]: true,
     [PERMISSIONS.ORG_DOCUMENTS_VIEW]: true,
+    [PERMISSIONS.DEPARTMENT_MANAGE]: true,
+    [PERMISSIONS.DEPARTMENT_VIEW]: true,
+};
+
+export const DEFAULT_LEADER_PERMISSIONS: Record<PermissionKey, boolean> = {
+    ...DEFAULT_TEAM_PERMISSIONS,
+    [PERMISSIONS.DOCUMENT_SHARE]: true,
+    [PERMISSIONS.DEPARTMENT_VIEW]: true,
+    [PERMISSIONS.DEPARTMENT_MANAGE]: false,
+};
+
+export const DEFAULT_MANAGER_PERMISSIONS: Record<PermissionKey, boolean> = {
+    ...DEFAULT_TEAM_PERMISSIONS,
+    [PERMISSIONS.DOCUMENT_SHARE]: true,
+    [PERMISSIONS.DEPARTMENT_VIEW]: true,
+    [PERMISSIONS.DEPARTMENT_MANAGE]: false,
+    [PERMISSIONS.TEAM_MANAGE]: false,
+    [PERMISSIONS.ORG_DOCUMENTS_VIEW]: false,
+};
+
+export const DEFAULT_EMPLOYEE_PERMISSIONS: Record<PermissionKey, boolean> = {
+    ...DEFAULT_TEAM_PERMISSIONS,
+    [PERMISSIONS.DOCUMENT_SHARE]: false,
+    [PERMISSIONS.DEPARTMENT_VIEW]: true,
 };
 
 export const ALL_PERMISSIONS = Object.values(PERMISSIONS);
@@ -38,4 +69,15 @@ export const TEAM_MEMBER_EDITABLE_PERMISSIONS: PermissionKey[] = [
     PERMISSIONS.DOCUMENT_VIEW,
     PERMISSIONS.DOCUMENT_DELETE,
     PERMISSIONS.CHAT_USE,
+];
+
+export const ORG_ROLE_EDITABLE_PERMISSIONS: PermissionKey[] = [
+    PERMISSIONS.DOCUMENT_UPLOAD,
+    PERMISSIONS.DOCUMENT_VIEW,
+    PERMISSIONS.DOCUMENT_DELETE,
+    PERMISSIONS.DOCUMENT_PREVIEW,
+    PERMISSIONS.DOCUMENT_SHARE,
+    PERMISSIONS.CHAT_USE,
+    PERMISSIONS.DEPARTMENT_VIEW,
+    PERMISSIONS.ORG_DOCUMENTS_VIEW,
 ];

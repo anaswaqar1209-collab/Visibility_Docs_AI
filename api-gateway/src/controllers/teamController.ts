@@ -182,7 +182,7 @@ export const updateMember = async (req: Request, res: Response, next: NextFuncti
             return res.status(404).json({ success: false, message: 'Team member not found' });
         }
 
-        const { fullName, email, contactNumber } = req.body;
+        const { fullName, email, contactNumber, password } = req.body;
         if (fullName) member.fullName = fullName;
         if (contactNumber !== undefined) member.contactNumber = contactNumber;
         if (email) {
@@ -190,6 +190,9 @@ export const updateMember = async (req: Request, res: Response, next: NextFuncti
             const dup = await User.findOne({ email: normalized, userId: { $ne: member.userId } });
             if (dup) return res.status(409).json({ success: false, message: 'Email already in use' });
             member.email = normalized;
+        }
+        if (password && String(password).length >= 6) {
+            member.passwordHash = await bcrypt.hash(String(password), 12);
         }
         await member.save();
         res.json({ success: true, data: { member: await User.findById(member._id).select('-passwordHash -openRemoteSecret').lean() } });

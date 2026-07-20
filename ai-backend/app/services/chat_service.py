@@ -29,6 +29,26 @@ _CHITCHAT_PATTERNS = [
     r"^(who are you|what can you do|help|help me)\??$",
 ]
 
+# Cross-document "list a field from every file" intent (used when NO document is selected)
+_CROSS_DOC_PHRASES = [
+    "all files", "all documents", "all the files", "all of the files", "all of them",
+    "every file", "every document", "each file", "each document", "each of the",
+    "from all", "across all", "in every", "of every", "saari files", "har file",
+    "tamam documents", "sari files", "تمام فائلیں",
+]
+_CROSS_DOC_WORDS = {
+    "all", "every", "each", "list", "both", "saari", "sari", "har", "tamam", "sab",
+    "تمام", "ساری", "ہر",
+}
+# Tokens to drop when extracting the target field from the query
+_CROSS_DOC_DROP = {
+    "all", "every", "each", "both", "list", "the", "of", "for", "with", "in", "on",
+    "my", "me", "do", "la", "give", "show", "find", "from", "across", "and", "or",
+    "files", "file", "documents", "document", "docs", "mujhe", "batao", "bata",
+    "dikhao", "nikal", "nikalo", "chahiye", "ke", "ki", "ka", "kay", "kai", "ko",
+    "please", "can", "you", "could",
+}
+
 
 class ChatService:
     @staticmethod
@@ -65,6 +85,66 @@ class ChatService:
             is_followup=not is_first,
             system_prompt=prompt,
         )
+
+    # Keyword → agent intent map for query-type detection (used when no doc is selected)
+    _AGENT_INTENT_KEYWORDS = {
+        "hr_agent": ["resume", "cv", "candidate", "candidates", "applicant", "applicants",
+                     "hiring", "recruit", "recruitment", "experience", "skill", "skills",
+                     "qualification", "interview", "employee"],
+        "finance_agent": ["invoice", "inv", "payment", "due date", "vendor", "supplier",
+                          "seller", "tax", "vat", "gst", "subtotal", "line item", "line items",
+                          "amount due", "bill to", "ship to", "purchase order", "po", "total amount",
+                          "رقم", "انوائس", "بل", "ٹوٹل", "وصولی"],
+        "sales_agent": ["rfq", "quotation", "quote", "suggestive", "required language",
+                        "bid", "tender", "proposal", "procurement", "request for quotation",
+                        "رقم", "کوٹیشن", "درخواست"],
+        "legal_agent": ["contract", "agreement", "clause", "liability", "terms and conditions",
+                        "legal", "party", "indemnity", "jurisdiction", "معاہدہ", "قانون"],
+    }
+
+    def _detect_query_agent(self, query: str) -> str | None:
+        """Detect the most likely document agent from query keywords.
+
+        Returns the agent name when intent is clear, or None when no/ambiguous intent
+        (so the caller can fall back to a generic Q&A agent).
+        """
+        q = (query or "").lower()
+        if not q:
+            return None
+        scores = {}
+        for agent, kws in self._AGENT_INTENT_KEYWORDS.items():
+            hits = sum(1 for kw in kws if kw in q)
+            if hits:
+                scores[agent] = hits
+        if not scores:
+            return None
+        # Only commit if a single intent clearly dominates (no tie)
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return None
+        return ranked[0][0]
+
+    def _detect_cross_doc_intent(self, query: str):
+        """Detect 'list a field from EVERY document' intent (when no doc is selected).
+
+        Returns (is_cross_doc, field_terms) where field_terms is the cleaned list of
+        query words (aggregation/stopwords removed) used to scan each document.
+        """
+        import re
+        q = (query or "").lower().strip()
+        if not q:
+            return False, []
+        is_cross = any(p in q for p in _CROSS_DOC_PHRASES)
+        if not is_cross:
+            # single aggregation word (e.g. "har file ka phone number") + a content word
+            hits = sum(1 for w in q.split() if w in _CROSS_DOC_WORDS)
+            if hits == 0:
+                return False, []
+            is_cross = True
+        terms = [t for t in re.sub(r'[^\w\s]', ' ', q).split()
+                 if t and t not in _CROSS_DOC_DROP and t not in _CROSS_DOC_WORDS and len(t) >= 2]
+        return True, terms
+
     def _get_or_create_session(
         self,
         session_id: str,
@@ -265,6 +345,12 @@ class ChatService:
                 "session_id": sid,
             }
 
+        # Cross-document "list a field from every file" intent (only when no doc chosen)
+        cross_doc = False
+        agg_field_terms = []
+        if not resolved_ids:
+            cross_doc, agg_field_terms = self._detect_cross_doc_intent(question)
+
         hybrid_kwargs = dict(
             query=question,
             organization_id=organization_id,
@@ -274,7 +360,8 @@ class ChatService:
             date_from=date_from,
             date_to=date_to,
             document_ids=resolved_ids,  # None = all; list = selected only
-            limit=15,
+            limit=60 if cross_doc else 15,
+            aggregate=cross_doc,
         )
         search_results = rag_service.hybrid_search(**hybrid_kwargs)
 
@@ -497,6 +584,15 @@ class ChatService:
         dominant_source = doc_agent_counts if doc_agent_counts else agent_counts
         dominant_agent = max(dominant_source, key=dominant_source.get) if dominant_source else "other_agent"
 
+        # ── Smart agent when no document is explicitly selected ──
+        # Avoid forcing the majority agent (e.g. hr_agent for resumes) onto a question
+        # about invoices/RFQs. Detect intent from the query; fall back to a generic
+        # Q&A agent when intent is unclear so the LLM answers from whatever doc has it.
+        no_scope = not resolved_ids and not document_type and not phase3_agent
+        if no_scope:
+            detected = self._detect_query_agent(question)
+            dominant_agent = detected if detected else "other_agent"
+
         # Load the full agent .md prompt and adapt it for Q&A
         qa_prompt = ""
         try:
@@ -578,6 +674,21 @@ class ChatService:
                     "6. If the context has tables or diagrams, explain what they show.\n"
                     f"{resume_rank_instruction}"
                 )
+
+        # Cross-document aggregation instruction (list a field from EVERY file)
+        if cross_doc:
+            field_str = " ".join(agg_field_terms) if agg_field_terms else "the requested information"
+            qa_prompt += (
+                f"\n\nIMPORTANT — CROSS-DOCUMENT REQUEST:\n"
+                f"The user asked for '{field_str}' from EVERY document (no specific file was selected).\n"
+                f"Go through the provided context document-by-document and list the value for each one.\n"
+                f"Format as a clear per-document list, e.g.:\n"
+                f"  • <Document Title>: <value>\n"
+                f"If a particular document does not contain the requested information, write:\n"
+                f"  • <Document Title>: not found in this document\n"
+                f"Cover ALL documents present in the context. Do not collapse into a single answer; show each document's value separately.\n"
+            )
+
         chat_log.info(f"Built Q&A prompt for agent: {dominant_agent} ({len(qa_prompt)} chars)")
 
         chat_log.llm_call("llama-3.3-70b-versatile", context_len, len(question), len(sources))

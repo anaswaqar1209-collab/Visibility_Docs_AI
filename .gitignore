@@ -20,3 +20,8 @@ ai-backend/.env.example
 uploads/
 shared-storage/
 
+# Friend's reference project used for cherry-picking improvements (not part of this repo's app)
+Visibility_Docs_AI_VM-main update model/
+
+# Temporary diff files used during merges
+_diff_app_*.txt

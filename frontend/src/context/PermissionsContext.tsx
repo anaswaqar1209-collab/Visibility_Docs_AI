@@ -20,6 +20,7 @@ type PermissionsContextValue = {
     canUpload: () => boolean;
     canViewDocs: () => boolean;
     canDeleteDocs: () => boolean;
+    canShareDocs: () => boolean;
     canChat: () => boolean;
 };
 
@@ -76,6 +77,7 @@ export function PermissionsProvider({ children }: { children: React.ReactNode })
             canUpload: () => hasPermission(PERMS.UPLOAD),
             canViewDocs: () => hasPermission(PERMS.VIEW),
             canDeleteDocs: () => hasPermission(PERMS.DELETE),
+            canShareDocs: () => hasPermission(PERMS.SHARE),
             canChat: () => hasPermission(PERMS.CHAT),
         }),
         [permissions, role, ready, reload, hasPermission]
@@ -96,6 +98,7 @@ export function usePermissions() {
             canUpload: () => checkPermission(PERMS.UPLOAD),
             canViewDocs: () => checkPermission(PERMS.VIEW),
             canDeleteDocs: () => checkPermission(PERMS.DELETE),
+            canShareDocs: () => checkPermission(PERMS.SHARE),
             canChat: () => checkPermission(PERMS.CHAT),
         };
     }

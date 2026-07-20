@@ -1,6 +1,6 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-export type ActivityCategory = 'auth' | 'document' | 'chat' | 'team' | 'admin' | 'security';
+export type ActivityCategory = 'auth' | 'document' | 'chat' | 'team' | 'admin' | 'security' | 'department';
 export type ActivityOutcome = 'success' | 'failure';
 
 export interface IActivityLog extends Document {
@@ -34,7 +34,7 @@ const ActivityLogSchema = new Schema<IActivityLog>(
         action: { type: String, required: true, index: true },
         category: {
             type: String,
-            enum: ['auth', 'document', 'chat', 'team', 'admin', 'security'],
+            enum: ['auth', 'document', 'chat', 'team', 'admin', 'security', 'department'],
             required: true,
             index: true,
         },

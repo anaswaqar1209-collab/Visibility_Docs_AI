@@ -34,9 +34,14 @@ def _get_supabase():
 def _get_local_db():
     if not hasattr(_local, "conn") or _local.conn is None:
         db_path = os.path.join(settings.UPLOAD_DIR, "..", "docs_ai.db")
-        _local.conn = sqlite3.connect(db_path, check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _init_local_db(_local.conn)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            _init_local_db(conn)
+        except Exception:
+            conn.close()
+            raise
+        _local.conn = conn
     return _local.conn
 
 
@@ -68,6 +73,10 @@ def _init_local_db(conn):
             chunk_index INTEGER DEFAULT 0,
             chunk_type TEXT DEFAULT 'paragraph',
             heading TEXT,
+            section TEXT,
+            section_number TEXT,
+            machine_id TEXT,
+            filename TEXT,
             content TEXT NOT NULL,
             chunk_text TEXT,
             metadata TEXT,
@@ -179,7 +188,6 @@ def _init_local_db(conn):
             updated_at TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_chat_sessions_org ON chat_sessions(organization_id);
-        CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id);
         CREATE TABLE IF NOT EXISTS chat_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -196,7 +204,6 @@ def _init_local_db(conn):
             organization_id TEXT NOT NULL DEFAULT 'default-org',
             created_at TEXT DEFAULT (datetime('now'))
         );
-        CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id);
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
@@ -207,6 +214,29 @@ def _init_local_db(conn):
         CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
         CREATE INDEX IF NOT EXISTS idx_users_org ON users(organization_id);
     """)
+    # Migrations for older local DBs (CREATE TABLE IF NOT EXISTS will not add new columns)
+    for stmt in (
+        "ALTER TABLE document_chunks ADD COLUMN chunk_text TEXT",
+        "ALTER TABLE documents ADD COLUMN phase3_agent TEXT",
+        "ALTER TABLE chat_sessions ADD COLUMN user_id TEXT",
+        "ALTER TABLE document_chunks ADD COLUMN section TEXT",
+        "ALTER TABLE document_chunks ADD COLUMN section_number TEXT",
+        "ALTER TABLE document_chunks ADD COLUMN machine_id TEXT",
+        "ALTER TABLE document_chunks ADD COLUMN filename TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass
+    # Indexes that depend on migrated columns
+    for stmt in (
+        "CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id)",
+    ):
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass
     try:
         conn.executescript("""
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -216,19 +246,7 @@ def _init_local_db(conn):
     except Exception:
         pass
     try:
-        conn.execute("ALTER TABLE document_chunks ADD COLUMN chunk_text TEXT")
-    except Exception:
-        pass
-    try:
-        conn.execute("ALTER TABLE documents ADD COLUMN phase3_agent TEXT")
-    except Exception:
-        pass
-    try:
-        conn.execute("ALTER TABLE chat_sessions ADD COLUMN user_id TEXT")
-    except Exception:
-        pass
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id)")
+        conn.commit()
     except Exception:
         pass
 
@@ -309,14 +327,23 @@ class SupabaseDB:
         return _local_select(table, columns, filters, like, limit, offset)
 
     @staticmethod
-    def batch_insert(table: str, records: list[dict]):
+    def batch_insert(table: str, records: list[dict]) -> list[dict]:
+        supabase_data = []
         try:
             client = _get_supabase()
             if _use_supabase and client:
-                client.table(table).insert(records).execute()
-        except Exception:
-            pass
-        _local_batch_insert(table, records)
+                res = client.table(table).insert(records).execute()
+                if hasattr(res, 'error') and res.error:
+                    print(f"[DB] batch_insert {table} error: {res.error}")
+                else:
+                    supabase_data = getattr(res, "data", []) or []
+        except Exception as e:
+            print(f"[DB] batch_insert {table} exception: {e}")
+        local_ids = _local_batch_insert(table, records)
+        # Fall back to local IDs if Supabase returned no data
+        if not supabase_data and local_ids:
+            supabase_data = [{"id": rid} for rid in local_ids]
+        return supabase_data
 
     @staticmethod
     def upload_file(bucket: str, path: str, file_data: bytes, content_type: str = None):
@@ -605,9 +632,10 @@ def _local_insert(table: str, data: dict):
         conn.commit()
         return type("Result", (), {"data": [dict(conn.execute("SELECT * FROM documents WHERE id=?", (data["id"],)).fetchone())]})()
     if table == "document_chunks":
-        cur = conn.execute("INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, content, chunk_text, metadata) VALUES (?,?,?,?,?,?,?,?)",
+        cur = conn.execute("INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, section, section_number, machine_id, filename, content, chunk_text, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                            (data.get("organization_id", ""), data.get("document_id", ""), data.get("page_id"), data.get("chunk_type", "paragraph"),
-                            data.get("heading"), data.get("content", ""), data.get("chunk_text") or data.get("content", ""),
+                            data.get("heading"), data.get("section"), data.get("section_number"), data.get("machine_id"), data.get("filename"),
+                            data.get("content", ""), data.get("chunk_text") or data.get("content", ""),
                             __import__("json").dumps(data.get("metadata")) if data.get("metadata") else None))
         conn.commit()
         chunk_id = cur.lastrowid
@@ -705,16 +733,25 @@ def _local_select(table: str, columns: str = "*", filters: dict = None, like: di
     return type("Result", (), {"data": [dict(r) for r in rows]})()
 
 
-def _local_batch_insert(table: str, records: list[dict]):
+def _local_batch_insert(table: str, records: list[dict]) -> list[int]:
     conn = _get_local_db()
+    ids = []
     if table == "document_chunks":
         doc_ids = set()
-        conn.executemany(
-            "INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, content, chunk_text, chunk_index, metadata) VALUES (?,?,?,?,?,?,?,?,?)",
+        cursor = conn.executemany(
+            "INSERT INTO document_chunks (organization_id, document_id, page_id, chunk_type, heading, section, section_number, machine_id, filename, content, chunk_text, chunk_index, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(r.get("organization_id", ""), r.get("document_id", ""), r.get("page_id"),
               r.get("chunk_type", "paragraph"), r.get("heading"),
+              r.get("section"), r.get("section_number"), r.get("machine_id"), r.get("filename"),
               r.get("content", ""), r.get("chunk_text") or r.get("content", ""),
               r.get("chunk_index", 0), __import__("json").dumps(r.get("metadata")) if r.get("metadata") else None) for r in records])
+        # Get lastrowid for each inserted record (they are sequential)
+        try:
+            last_id = cursor.lastrowid
+            if last_id:
+                ids = list(range(last_id - len(records) + 1, last_id + 1))
+        except Exception:
+            pass
         for r in records:
             if r.get("document_id"):
                 doc_ids.add(r["document_id"])
@@ -727,6 +764,7 @@ def _local_batch_insert(table: str, records: list[dict]):
             [(r.get("organization_id", ""), r.get("document_id", ""), r.get("chunk_id"),
               str(r.get("embedding", [])), r.get("model_name", "all-MiniLM-L6-v2")) for r in records])
         conn.commit()
+    return ids
 
 
 def _local_select_in(table: str, columns: str = "*", filters: dict = None, in_column: str = None, in_values: list = None):
@@ -759,11 +797,19 @@ def _local_fts_sync(document_id: str = None):
             rows = conn.execute("SELECT id, content, chunk_text, document_id, organization_id, page_id FROM document_chunks").fetchall()
         for r in rows:
             try:
-                fts_content = r["content"]
-                if r.get("chunk_text"):
-                    fts_content = r["chunk_text"]
+                row = dict(r)
+                fts_parts = []
+                if row.get("content"):
+                    fts_parts.append(str(row["content"]))
+                if row.get("chunk_text") and row.get("chunk_text") != row.get("content"):
+                    fts_parts.append(str(row["chunk_text"]))
+                # Include heading text so label-based invoice queries can match.
+                heading = row.get("heading")
+                if heading:
+                    fts_parts.insert(0, str(heading))
+                fts_content = "\n".join(fts_parts) if fts_parts else ""
                 conn.execute("INSERT INTO chunks_fts (rowid, content, document_id, organization_id, page_id) VALUES (?, ?, ?, ?, ?)",
-                             (r["id"], fts_content, r["document_id"], r["organization_id"], r["page_id"]))
+                             (row["id"], fts_content, row["document_id"], row["organization_id"], row["page_id"]))
             except Exception:
                 pass
         conn.commit()
@@ -780,7 +826,13 @@ def _local_keyword_search(query: str, organization_id: str = None, limit: int = 
         terms = [t for t in cleaned.split() if t]
         if not terms:
             return []
-        fts_query = " AND ".join(f'"{t}"*' for t in terms)
+        # High-recall FTS5: phrase match (precision) OR per-term match (recall)
+        term_queries = " OR ".join(f'"{t}"*' for t in terms)
+        if len(terms) > 1:
+            phrase = " ".join(terms)
+            fts_query = f'"{phrase}"* OR {term_queries}'
+        else:
+            fts_query = term_queries
 
         sql = "SELECT c.rowid, c.*, rank FROM chunks_fts c WHERE c.content MATCH ?"
         params = [fts_query]
@@ -809,6 +861,7 @@ def _local_search_vector(query_vector: list, match_threshold: float = 0.7, match
             return type("Result", (), {"data": []})()
         scores = []
         for row in rows:
+            row = dict(row)
             raw = row["embedding"]
             try:
                 stored = list(raw)
@@ -820,9 +873,8 @@ def _local_search_vector(query_vector: list, match_threshold: float = 0.7, match
             if score >= match_threshold:
                 if filter_org_id and row.get("organization_id") != filter_org_id:
                     continue
-                r = dict(row)
-                r.pop("embedding", None)
-                scores.append((score, r))
+                row.pop("embedding", None)
+                scores.append((score, row))
         scores.sort(key=lambda x: x[0], reverse=True)
         for score, row in scores[:match_count]:
             result_data.append({**row, "similarity": score})

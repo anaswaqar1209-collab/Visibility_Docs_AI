@@ -49,6 +49,8 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
             role: user.role,
             organizationId: user.organizationId,
             permissions,
+            primaryDepartmentId: user.primaryDepartmentId || null,
+            orgRoleId: user.orgRoleId || null,
             openRemoteRealm: user.openRemoteRealm || null,
             realm: user.openRemoteRealm || null,
             openRemoteUserId: user.openRemoteUserId || null,

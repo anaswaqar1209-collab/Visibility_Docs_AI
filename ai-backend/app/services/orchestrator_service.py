@@ -72,11 +72,46 @@ class OrchestratorService:
             "error_message": error,
         })
 
+    def _find_relocated_file(self, old_path: str) -> str | None:
+        """Find a file that was moved by gateway by-type relocate (inbox → by-type/{type}/…)."""
+        from ..utils.file_utils import resolve_shared_storage_root
+
+        root = resolve_shared_storage_root()
+        if not root or not os.path.isdir(root):
+            return None
+
+        basename = os.path.basename(old_path or "")
+        doc_folder = None
+        parts = os.path.normpath(old_path or "").split(os.sep)
+        for part in reversed(parts):
+            if part.startswith("doc_"):
+                doc_folder = part
+                break
+
+        matches: list[str] = []
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if basename and basename in filenames:
+                candidate = os.path.abspath(os.path.join(dirpath, basename))
+                if doc_folder and doc_folder not in candidate:
+                    continue
+                if os.path.isfile(candidate):
+                    matches.append(candidate)
+            elif doc_folder and os.path.basename(dirpath) == doc_folder:
+                for name in filenames:
+                    candidate = os.path.abspath(os.path.join(dirpath, name))
+                    if os.path.isfile(candidate):
+                        matches.append(candidate)
+
+        if not matches:
+            return None
+        # Prefer the most recently modified copy
+        matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return matches[0]
+
     def _resolve_file(self, doc: dict) -> str:
         fp = doc.get("original_file_url", "")
         if not fp:
             raise FileNotFoundError("File path not found")
-        import os
         if os.path.exists(fp):
             return fp
         if fp.startswith("http"):
@@ -89,6 +124,16 @@ class OrchestratorService:
             tmp.close()
             logger.info(f"Downloaded remote file to {tmp.name}")
             return tmp.name
+
+        recovered = self._find_relocated_file(fp)
+        if recovered:
+            logger.info(f"Recovered relocated file for {doc.get('id')}: {fp} → {recovered}")
+            try:
+                SupabaseDB.update("documents", {"original_file_url": recovered}, "id", doc["id"])
+            except Exception as e:
+                logger.warning(f"Could not persist recovered path: {e}")
+            return recovered
+
         raise FileNotFoundError(f"File not found: {fp}")
 
     def classify_only(self, document_id: str, organization_id: str) -> dict:
@@ -212,6 +257,7 @@ class OrchestratorService:
         classification = {"document_type": "other", "confidence": 0.0, "reasoning": ""}
         extraction = {"extracted_data": {}, "confidence": 0.0}
         page_count = 0
+        job = {"stage": "queued", "status": "queued"}
 
         try:
             job = self.get_or_create_job(document_id, organization_id)
@@ -332,6 +378,21 @@ class OrchestratorService:
                     if detected_tables:
                         table_text = tables_to_text(detected_tables)
                         raw_text = table_text + "\n\n" + raw_text
+                        try:
+                            SupabaseDB.insert("document_extractions", {
+                                "organization_id": organization_id,
+                                "document_id": document_id,
+                                "extraction_type": "table_extraction",
+                                "extracted_data": {
+                                    "table_count": len(detected_tables),
+                                    "table_text": table_text,
+                                    "tables": detected_tables,
+                                },
+                                "confidence": 1.0,
+                            })
+                            SupabaseDB.update("documents", {"raw_text": raw_text}, "id", document_id)
+                        except Exception as e:
+                            log.warn(f"Table extraction persist failed: {e}")
                         log.ok(f"Found {len(detected_tables)} tables ({len(table_text)} chars) prepended to text")
                     else:
                         log.ok("No tables detected")
@@ -352,7 +413,9 @@ class OrchestratorService:
                 log.info("Running in parallel with embedding...")
 
                 ext_future = pool.submit(category_agents.extract, raw_text, doc_type, effective_agent)
-                emb_future = pool.submit(rag_service.index_document, document_id, organization_id, raw_text, file_path)
+                _filename = os.path.basename(file_path) if file_path else ""
+                emb_future = pool.submit(rag_service.index_document, document_id, organization_id, raw_text, file_path,
+                                         document_type=doc_type, filename=_filename)
 
                 t0 = time.time()
                 extraction = ext_future.result(timeout=120)  # 2 min timeout
@@ -392,6 +455,16 @@ class OrchestratorService:
                 "extracted_data": extraction.get("extracted_data", {}),
                 "confidence": extraction.get("confidence", 0),
             })
+            try:
+                rag_service.index_structured_summary(
+                    document_id=document_id,
+                    organization_id=organization_id,
+                    document_type=doc_type,
+                    extracted_data=extraction.get("extracted_data", {}),
+                    field_confidence=extraction.get("field_confidence", {}),
+                )
+            except Exception as e:
+                log.warn(f"Structured summary indexing skipped: {e}")
             self.update_stage(document_id, organization_id, "extracted", 80)
             self.update_stage(document_id, organization_id, "embedded", 95)
 

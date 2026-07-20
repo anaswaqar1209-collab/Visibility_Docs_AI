@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { Loader2, Star, Trash2 } from "lucide-react";
+import { Download, Loader2, Star, Trash2 } from "lucide-react";
 import { apiRequest } from "@/lib/apiClient";
 import { inferDocTypeFromFilename } from "@/lib/documentAgents";
 import { appendAuthToken } from "@/lib/documents";
@@ -152,8 +152,27 @@ export default function DocumentDetailPanel({
     const cvData = (ai?.cv_extraction_data || null) as Record<string, unknown> | null;
     const rawText = typeof ai?.raw_text === "string" ? ai.raw_text : "";
     const extracted = (ai?.extracted_data || null) as Record<string, unknown> | null;
+    const extractions = Array.isArray(ai?.extractions) ? (ai?.extractions as Array<Record<string, unknown>>) : [];
+    const tableExtractions = extractions.filter((ext) => String(ext?.extraction_type || "") === "table_extraction");
     const displayStatus = statusLabel(String(ai?.status || doc.status));
     const finished = isAnalysisFinished(ai, undefined, doc.status);
+
+    const downloadTablesMarkdown = () => {
+        const parts = tableExtractions.map((table, index) => {
+            const extractedData = table?.extracted_data as Record<string, unknown> | null;
+            const tableText = typeof extractedData?.table_text === "string" ? extractedData.table_text : "";
+            return `## Table ${index + 1}\n\n${tableText || "No markdown available."}`;
+        });
+        const blob = new Blob([parts.join("\n\n")], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `${doc.originalFilename.replace(/[^\w-]+/g, "_")}_tables.md`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        URL.revokeObjectURL(url);
+    };
     const isProcessing = analyzing && !finished && (displayStatus === "processing" || doc.status === "processing");
     const showCv = docType === "resume" || inferredType === "resume";
     const showSkeleton = isProcessing || (analyzing && !hasModelData(ai));
@@ -307,6 +326,49 @@ export default function DocumentDetailPanel({
                                 </p>
                             </div>
                         )}
+                    </div>
+                </div>
+            )}
+
+            {tableExtractions.length > 0 && (
+                <div className={`${cardClass} p-5`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                        <p className={`text-sm font-semibold ${colors.textPrimary}`}>Extracted Tables</p>
+                        <button
+                            type="button"
+                            onClick={downloadTablesMarkdown}
+                            className="inline-flex items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                        >
+                            <Download size={14} />
+                            Download Markdown
+                        </button>
+                    </div>
+                    <div className="space-y-6">
+                        {tableExtractions.map((table, index) => {
+                            const extractedData = table?.extracted_data as Record<string, unknown> | null;
+                            const tableText = typeof extractedData?.table_text === "string" ? extractedData.table_text : "";
+                            const tableCount = Number(extractedData?.table_count ?? 0);
+                            const page = extractedData?.tables && Array.isArray(extractedData.tables) && extractedData.tables[index]?.page;
+                            const source = typeof extractedData?.tables === "object" && Array.isArray(extractedData.tables) && extractedData.tables[index]?.source ? String(extractedData.tables[index].source) : undefined;
+
+                            return (
+                                <div key={index} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4">
+                                    <div className="flex flex-wrap items-center gap-2 mb-3">
+                                        <span className="text-sm font-semibold">Table extraction #{index + 1}</span>
+                                        <span className="text-xs text-[var(--foreground-muted)]">count: {tableCount}</span>
+                                        {page != null && <span className="text-xs text-[var(--foreground-muted)]">page: {page}</span>}
+                                        {source && <span className="text-xs text-[var(--foreground-muted)]">source: {source}</span>}
+                                    </div>
+                                    {tableText ? (
+                                        <pre className={`text-xs overflow-x-auto max-h-[40vh] font-mono whitespace-pre-wrap ${colors.textMuted}`}>
+                                            {tableText}
+                                        </pre>
+                                    ) : (
+                                        <div className="text-sm text-[var(--foreground-muted)]">No table markdown available.</div>
+                                    )}
+                                </div>
+                            );
+                        })}
                     </div>
                 </div>
             )}

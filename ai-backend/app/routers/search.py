@@ -35,6 +35,11 @@ async def search_documents(request: SearchRequest = Body(...)):
             document_type=r.get("document_type"),
             chunk_text=r["chunk_text"][:500],
             page_number=r.get("page_number"),
+            heading=r.get("heading"),
+            section=r.get("section"),
+            section_number=r.get("section_number"),
+            machine_id=r.get("machine_id"),
+            filename=r.get("filename"),
             score=r["score"],
             metadata=r.get("metadata"),
         )

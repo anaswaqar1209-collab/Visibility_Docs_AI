@@ -379,5 +379,13 @@ export async function saveUploadedFile(
         },
     });
 
+    try {
+        const { applyDocumentVisibilityScope } = await import('./documentVisibility');
+        await applyDocumentVisibilityScope(doc, null);
+        await doc.save();
+    } catch (e: any) {
+        logger.warn(`Initial visibility assignment failed for ${doc.documentId}: ${e?.message || e}`);
+    }
+
     return { doc, aiModelResponse };
 }

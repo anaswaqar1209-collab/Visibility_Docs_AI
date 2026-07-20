@@ -5,7 +5,10 @@ export const PERMS = {
     VIEW: "document.view",
     DELETE: "document.delete",
     PREVIEW: "document.preview",
+    SHARE: "document.share",
     CHAT: "chat.use",
+    DEPT_VIEW: "department.view",
+    DEPT_MANAGE: "department.manage",
 } as const;
 
 /** Permissions editable for team members (shown in Team UI). */
@@ -22,7 +25,10 @@ export const DEFAULT_TEAM_PERMS: Record<string, boolean> = {
     [PERMS.VIEW]: true,
     [PERMS.DELETE]: true,
     [PERMS.PREVIEW]: true,
+    [PERMS.SHARE]: false,
     [PERMS.CHAT]: true,
+    [PERMS.DEPT_VIEW]: true,
+    [PERMS.DEPT_MANAGE]: false,
 };
 
 export function getUserPermissions(): Record<string, boolean> {
@@ -65,4 +71,13 @@ export function canDeleteDocs() {
 }
 export function canChat() {
     return hasAppPermission(PERMS.CHAT);
+}
+export function canShareDocs() {
+    return hasAppPermission(PERMS.SHARE);
+}
+export function canViewDepartments() {
+    return hasAppPermission(PERMS.DEPT_VIEW);
+}
+export function canManageDepartments() {
+    return hasAppPermission(PERMS.DEPT_MANAGE);
 }

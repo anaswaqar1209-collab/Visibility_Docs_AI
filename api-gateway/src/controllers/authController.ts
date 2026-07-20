@@ -395,12 +395,47 @@ export const me = async (req: Request, res: Response) => {
         res.status(404).json({ success: false, message: 'User not found' });
         return;
     }
+
+    let department: Record<string, unknown> | null = null;
+    let orgRole: Record<string, unknown> | null = null;
+    try {
+        const { default: DepartmentMember } = await import('../models/DepartmentMember');
+        const { default: Department } = await import('../models/Department');
+        const { default: OrgRole } = await import('../models/OrgRole');
+        const membership = await DepartmentMember.findOne({ userId: user.userId }).lean();
+        if (membership) {
+            const [dept, role] = await Promise.all([
+                Department.findOne({ departmentId: membership.departmentId }).lean(),
+                OrgRole.findOne({ roleId: membership.orgRoleId }).lean(),
+            ]);
+            if (dept) {
+                department = {
+                    departmentId: dept.departmentId,
+                    name: dept.name,
+                    slug: dept.slug,
+                    allowedDocumentTypes: dept.allowedDocumentTypes,
+                };
+            }
+            if (role) {
+                orgRole = {
+                    roleId: role.roleId,
+                    name: role.name,
+                    isLeader: role.isLeader,
+                };
+            }
+        }
+    } catch {
+        /* ignore enrichment errors */
+    }
+
     res.json({
         success: true,
         data: {
             user: {
                 ...user,
                 permissions: userPermissionsForResponse(user),
+                department,
+                orgRole,
             },
         },
     });

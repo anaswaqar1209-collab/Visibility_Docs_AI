@@ -1,4 +1,4 @@
-"""Start script — auto-frees port 8000, then launches the server."""
+"""Start script — frees THIS app's port listeners, then launches the server."""
 import os
 import sys
 import time
@@ -11,32 +11,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("run")
 
 HOST = "0.0.0.0"
-PORT = 8000
+# Default 8001 — avoids clash with other local apps on 8000 (e.g. PHP/Laravel)
+PORT = int(os.getenv("AI_BACKEND_PORT", "8001"))
 
 
 def free_port(port: int):
-    """Find and kill any process listening on the given port."""
+    """Kill every process listening on the given port (IPv4/IPv6, all bind addresses)."""
     try:
         result = subprocess.run(
             ["netstat", "-ano"], capture_output=True, text=True,
             creationflags=subprocess.CREATE_NO_WINDOW
         )
+        pids = set()
+        needle = f":{port}"
         for line in result.stdout.splitlines():
             parts = line.strip().split()
-            if len(parts) >= 5 and f":{port}" in parts[1] and "LISTENING" in parts[3]:
-                pid = parts[-1]
-                subprocess.run(["taskkill", "/F", "/PID", pid],
-                               capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                logger.info(f"Killed PID {pid} (held port {port})")
-                time.sleep(1)
-                return
+            if len(parts) < 5 or "LISTENING" not in parts:
+                continue
+            local = parts[1]
+            if local.endswith(needle) or local.endswith(f"]{needle}"):
+                pids.add(parts[-1])
+
+        for pid in pids:
+            if not pid.isdigit() or pid == "0":
+                continue
+            # Only kill our own python/uvicorn if possible — still free the port we need
+            subprocess.run(
+                ["taskkill", "/F", "/PID", pid],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            logger.info(f"Killed PID {pid} (held port {port})")
+
+        if pids:
+            time.sleep(1.5)
     except Exception as e:
         logger.warning(f"free_port error: {e}")
 
 
 if __name__ == "__main__":
     free_port(PORT)
-    logger.info(f"Starting server on {HOST}:{PORT}...")
+    logger.info(f"Starting Visibility Docs AI on {HOST}:{PORT}...")
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     from uvicorn.main import run

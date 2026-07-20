@@ -63,12 +63,30 @@ class EmbeddingService:
             logger.error(f"embed_text failed: {e}")
             return [0.0] * self.dimension
 
-    def embed_chunks(self, chunks: list[str], document_id: str = None, organization_id: str = None) -> list[list[float]]:
+    def embed_chunks(self, chunks: list[str], document_id: str = None, organization_id: str = None,
+                     chunk_metadata: list[dict] = None) -> list[list[float]]:
         print(f"[EMBED] Processing {len(chunks)} chunks for doc {document_id[:12] if document_id else '?'}...")
+        # Prepend heading/section context to chunk text for better embedding
+        enriched = []
+        for i, chunk in enumerate(chunks):
+            prefix = ""
+            if chunk_metadata and i < len(chunk_metadata):
+                meta = chunk_metadata[i]
+                parts = []
+                if meta.get("section_number"):
+                    parts.append(f"Section {meta['section_number']}")
+                if meta.get("heading"):
+                    parts.append(meta["heading"])
+                if meta.get("section"):
+                    parts.append(meta["section"])
+                if parts:
+                    prefix = " | ".join(parts) + " | "
+            enriched.append(prefix + chunk)
+
         uncached = []
         uncached_idx = []
         results = [None] * len(chunks)
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(enriched):
             key = hashlib.md5(chunk.encode()).hexdigest()
             cached = self._cache.get(key)
             if cached is not None:
@@ -93,7 +111,7 @@ class EmbeddingService:
                     results[idx] = val
                     if len(self._cache) >= self._cache_max:
                         self._cache.clear()
-                    self._cache[hashlib.md5(chunks[idx].encode()).hexdigest()] = val
+                    self._cache[hashlib.md5(enriched[idx].encode()).hexdigest()] = val
             except Exception as e:
                 logger.error(f"embed_chunks encode failed: {e}")
                 for idx in uncached_idx:
@@ -104,12 +122,29 @@ class EmbeddingService:
                 vectors = []
                 for i, (chunk, emb) in enumerate(zip(chunks, results)):
                     vid = f"{document_id}_{hashlib.md5(chunk.encode()).hexdigest()}"
-                    vectors.append((vid, emb, {
+                    meta = {
                         "document_id": document_id,
                         "organization_id": organization_id,
                         "chunk_index": i,
                         "chunk_text": chunk[:1000],
-                    }))
+                    }
+                    if chunk_metadata and i < len(chunk_metadata):
+                        cm = chunk_metadata[i]
+                        if cm.get("heading"):
+                            meta["heading"] = cm["heading"]
+                        if cm.get("page_number"):
+                            meta["page_number"] = cm["page_number"]
+                        if cm.get("document_type"):
+                            meta["document_type"] = cm["document_type"]
+                        if cm.get("section"):
+                            meta["section"] = cm["section"]
+                        if cm.get("section_number"):
+                            meta["section_number"] = cm["section_number"]
+                        if cm.get("machine_id"):
+                            meta["machine_id"] = cm["machine_id"]
+                        if cm.get("filename"):
+                            meta["filename"] = cm["filename"]
+                    vectors.append((vid, emb, meta))
                 print(f"[EMBED] Upserting {len(vectors)} vectors to Pinecone (namespace={organization_id})...")
                 t0 = __import__("time").time()
                 pinecone_service.upsert(vectors, namespace=organization_id)

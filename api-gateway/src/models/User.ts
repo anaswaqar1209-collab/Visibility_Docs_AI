@@ -8,9 +8,12 @@ export interface IUserPermissions {
     'document.view'?: boolean;
     'document.delete'?: boolean;
     'document.preview'?: boolean;
+    'document.share'?: boolean;
     'chat.use'?: boolean;
     'team.manage'?: boolean;
     'org.documents.view'?: boolean;
+    'department.manage'?: boolean;
+    'department.view'?: boolean;
 }
 
 export interface IUser extends Document {
@@ -25,6 +28,10 @@ export interface IUser extends Document {
     organizationId?: string | null;
     createdBy?: string | null;
     permissions?: IUserPermissions;
+    /** Primary department for document affinity / visibility (v1: one dept) */
+    primaryDepartmentId?: string | null;
+    /** Department org-role template (Leader / Employee / Manager) */
+    orgRoleId?: string | null;
     status: 'active' | 'blocked' | 'pending';
     emailVerified?: boolean;
     openRemoteRealm?: string | null;
@@ -43,9 +50,12 @@ const PermissionsSchema = new Schema<IUserPermissions>(
         'document.view': { type: Boolean, default: true },
         'document.delete': { type: Boolean, default: true },
         'document.preview': { type: Boolean, default: true },
+        'document.share': { type: Boolean, default: false },
         'chat.use': { type: Boolean, default: true },
         'team.manage': { type: Boolean, default: false },
         'org.documents.view': { type: Boolean, default: false },
+        'department.manage': { type: Boolean, default: false },
+        'department.view': { type: Boolean, default: true },
     },
     { _id: false }
 );
@@ -72,6 +82,8 @@ const UserSchema = new Schema<IUser>(
         organizationId: { type: String, default: null, index: true },
         createdBy: { type: String, default: null },
         permissions: { type: PermissionsSchema, default: () => ({ ...DEFAULT_TEAM_PERMISSIONS }) },
+        primaryDepartmentId: { type: String, default: null, index: true },
+        orgRoleId: { type: String, default: null, index: true },
         status: {
             type: String,
             enum: ['active', 'blocked', 'pending'],
