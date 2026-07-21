@@ -128,19 +128,19 @@ async def classify_document(document_id: str, request: Request):
 @router.get(
     "/{document_id}/file",
     summary="Download/serve uploaded file",
-    description="Returns the original uploaded file for viewing or download",
+    description="Returns the original uploaded file for viewing or download. Accepts optional page parameter for PDF page navigation.",
 )
-async def get_document_file(document_id: str, organization_id: str = ""):
+async def get_document_file(document_id: str, organization_id: str = "", page: int = 0):
     doc = document_service.get_document(document_id, organization_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     file_path = doc.get("original_file_url", "")
     if not file_path:
         raise HTTPException(status_code=404, detail="File not found")
-    if file_path.startswith("http"):
-        return RedirectResponse(url=file_path)
-    supabase_url = f"{settings.SUPABASE_URL}/storage/v1/object/public/documents/{file_path}"
-    return RedirectResponse(url=supabase_url)
+    url = file_path if file_path.startswith("http") else f"{settings.SUPABASE_URL}/storage/v1/object/public/documents/{file_path}"
+    if page > 0:
+        url += f"#page={page}"
+    return RedirectResponse(url=url)
 
 
 @router.post(
