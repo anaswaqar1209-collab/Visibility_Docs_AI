@@ -9,15 +9,15 @@ export default function HomePage() {
 
     useEffect(() => {
         if (hasValidAccessToken() || getAuthValue("accessToken")) {
-            router.replace("/documents");
+            router.replace("/dashboard");
         } else {
             router.replace("/login");
         }
     }, [router]);
 
     return (
-        <div className="min-h-screen flex items-center justify-center text-slate-400 bg-[#050508]">
-            Redirecting…
+        <div className="min-h-screen flex items-center justify-center text-slate-400 bg-[#f4f7fb]">
+            Redirecting...
         </div>
     );
 }

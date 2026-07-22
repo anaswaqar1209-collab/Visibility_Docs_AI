@@ -5,15 +5,17 @@ import { useRouter, usePathname } from "next/navigation";
 import { Menu } from "lucide-react";
 import Sidebar from "./Sidebar";
 import { ToastProvider } from "./Toast";
-import { ColorProvider, useTheme } from "@/context/ColorContext";
+import { ColorProvider } from "@/context/ColorContext";
 import { PermissionsProvider, usePermissions } from "@/context/PermissionsContext";
 import { GroqLimitProvider } from "./GroqLimitModal";
 import { clearAuthState, hasValidAccessToken, canRefreshSession, getAuthValue } from "@/lib/authSession";
 
 const PAGE_TITLES: Record<string, string> = {
+    "/dashboard": "Dashboard",
     "/documents": "Documents",
     "/chat": "AI Chat",
     "/activity": "Activity",
+    "/profile": "Profile",
     "/admin/departments": "Departments",
     "/admin/admins": "Admins",
     "/admin/documents": "All Documents",
@@ -33,8 +35,6 @@ function resolvePageTitle(pathname: string | null): string {
 }
 
 function Shell({ children }: { children: React.ReactNode }) {
-    const { theme } = useTheme();
-    const colors = theme.colors;
     const router = useRouter();
     const pathname = usePathname();
     const { ready, reload, role } = usePermissions();
@@ -56,12 +56,12 @@ function Shell({ children }: { children: React.ReactNode }) {
 
     useEffect(() => {
         if (ready && role === "superAdmin" && pathname) {
-            const allowedRoutes = ["/admin/documents", "/chat", "/activity", "/admin/admins", "/admin/settings"];
+            const allowedRoutes = ["/dashboard", "/admin/documents", "/chat", "/activity", "/admin/admins", "/admin/settings"];
             const isAllowed = allowedRoutes.some(
                 (route) => pathname === route || pathname.startsWith(`${route}/`)
             );
             if (!isAllowed) {
-                router.replace("/admin/documents");
+                router.replace("/dashboard");
             }
         }
     }, [ready, role, pathname, router]);
@@ -75,14 +75,14 @@ function Shell({ children }: { children: React.ReactNode }) {
             <div className="min-h-screen flex items-center justify-center app-shell text-[var(--foreground-muted)] relative">
                 <div className="flex flex-col items-center gap-3 relative z-[1]">
                     <div className="spinner" />
-                    <p className="text-sm">Loading workspace…</p>
+                    <p className="text-sm">Loading workspace...</p>
                 </div>
             </div>
         );
     }
 
     return (
-        <div className={`h-screen flex overflow-hidden app-shell ${colors.textPrimary} relative`}>
+        <div className="h-screen flex overflow-hidden app-shell text-[var(--foreground)] relative">
             <Sidebar open={navOpen} onClose={closeNav} />
             <div className="flex-1 min-w-0 min-h-0 flex flex-col relative z-[1]">
                 <header className="lg:hidden shrink-0 flex items-center gap-3 px-3 sm:px-4 py-2.5 border-b border-[var(--border)] bg-[var(--surface)]/95 backdrop-blur-md">

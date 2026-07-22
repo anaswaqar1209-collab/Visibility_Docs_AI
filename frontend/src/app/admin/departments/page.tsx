@@ -941,14 +941,46 @@ function DepartmentsAdminContent() {
                             </form>
 
                             <div>
-                                <h3 className="text-sm font-semibold text-[var(--foreground)] px-1 mb-3">
-                                    Current members ({teamMembers.length})
-                                </h3>
+                                <div className="flex items-center justify-between px-1 mb-3">
+                                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
+                                        Current members ({teamMembers.length})
+                                    </h3>
+                                    {teamMembers.length > 0 && (
+                                        <div className="flex items-center gap-2 text-[11px] text-[var(--foreground-muted)]">
+                                            <span className="inline-flex items-center gap-1">
+                                                <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                                                {teamMembers.filter((m) => m.status === "active").length} active
+                                            </span>
+                                            <span className="inline-flex items-center gap-1">
+                                                <span className="w-2 h-2 rounded-full bg-rose-400" />
+                                                {teamMembers.filter((m) => m.status === "blocked").length} blocked
+                                            </span>
+                                        </div>
+                                    )}
+                                </div>
                                 <div className="space-y-2">
-                                    {teamMembers.map((m) => (
-                                        <div key={m.userId} className="surface-card px-4 py-3">
-                                            <div className="flex items-start justify-between gap-3">
-                                                <div className="min-w-0">
+                                    {teamMembers.map((m) => {
+                                        const avatarColors = [
+                                            "bg-rose-500/20 text-rose-400",
+                                            "bg-blue-500/20 text-blue-400",
+                                            "bg-emerald-500/20 text-emerald-400",
+                                            "bg-amber-500/20 text-amber-400",
+                                            "bg-violet-500/20 text-violet-400",
+                                            "bg-cyan-500/20 text-cyan-400",
+                                        ];
+                                        let hash = 0;
+                                        for (let i = 0; i < m.fullName.length; i++) hash = m.fullName.charCodeAt(i) + ((hash << 5) - hash);
+                                        const colorClass = avatarColors[Math.abs(hash) % avatarColors.length];
+                                        const initials = m.fullName.trim().split(/\s+/).length >= 2
+                                            ? (m.fullName.trim().split(/\s+/)[0][0] + m.fullName.trim().split(/\s+/)[1][0]).toUpperCase()
+                                            : (m.fullName.trim()[0] || "?").toUpperCase();
+
+                                        return (
+                                            <div key={m.userId} className="surface-card px-4 py-3 flex items-start gap-3 hover:border-[var(--border-strong)] transition-colors">
+                                                <div className={`h-10 w-10 rounded-xl ${colorClass} flex items-center justify-center shrink-0 font-semibold text-sm`}>
+                                                    {initials}
+                                                </div>
+                                                <div className="min-w-0 flex-1">
                                                     <div className="flex items-center gap-2 flex-wrap">
                                                         <p className="text-sm font-medium text-[var(--foreground)] truncate">
                                                             {m.fullName}
@@ -961,18 +993,19 @@ function DepartmentsAdminContent() {
                                                     <p className="text-[11px] text-[var(--foreground-muted)] truncate">{m.email}</p>
                                                     <div className="flex flex-wrap gap-1.5 mt-2">
                                                         <Badge variant={m.primaryDepartmentId ? "accent" : "muted"}>
+                                                            <Building2 size={10} />
                                                             {m.primaryDepartmentId
                                                                 ? deptNameById[m.primaryDepartmentId] || "Assigned"
                                                                 : "No department"}
                                                         </Badge>
                                                         {m.orgRoleId && (
-                                                            <Badge variant="default">
+                                                            <Badge variant={roles.find((r) => r.roleId === m.orgRoleId)?.isLeader ? "warning" : "default"}>
                                                                 {roleNameById[m.orgRoleId] || "Role"}
                                                             </Badge>
                                                         )}
                                                     </div>
                                                 </div>
-                                                <div className="flex flex-col gap-0.5 shrink-0">
+                                                <div className="flex items-center gap-0.5 shrink-0">
                                                     <button
                                                         type="button"
                                                         onClick={() => startEditMember(m)}
@@ -1013,10 +1046,14 @@ function DepartmentsAdminContent() {
                                                     </button>
                                                 </div>
                                             </div>
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
                                     {!teamMembers.length && (
-                                        <p className="text-sm text-[var(--foreground-muted)] px-1">No members yet.</p>
+                                        <EmptyState
+                                            icon={<Users size={24} className="text-[var(--accent)]" />}
+                                            title="No members yet"
+                                            description="Add team members above to populate this list."
+                                        />
                                     )}
                                 </div>
                             </div>
